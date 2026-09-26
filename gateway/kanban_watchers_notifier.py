@@ -30,6 +30,17 @@ def _kbn():
     from hermes_cli import kanban_db_notify
     return kanban_db_notify
 
+
+def _public_assignee_label(assignee: Optional[str]) -> str:
+    """Present verified profile metadata, never expose an internal routing key."""
+    if not assignee:
+        return ""
+    from hermes_cli.profiles import get_profile_dir, read_profile_meta
+    try:
+        return read_profile_meta(get_profile_dir(assignee)).get("display_name", "")
+    except (ValueError, OSError):
+        return ""
+
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
@@ -496,7 +507,8 @@ class _KanbanNotification:
         self.title = (task.title if task else sub["task_id"])[:120]
         self.board_tag = f"[{self.board_slug}] " if self.board_slug else ""
         # Attribute the ping to the worker that did the work.
-        tag = f"@{task.assignee} " if task and task.assignee else ""
+        self.assignee_label = _public_assignee_label(task.assignee if task else None)
+        tag = f"@{self.assignee_label} " if self.assignee_label else ""
         self.head = f"{self.board_tag}{tag}Kanban {self.task_id}"
         # The wake self-post path needs the key even when every event was skipped.
         self.sub_key = (sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or "")
@@ -577,7 +589,7 @@ class _KanbanNotification:
         synth = t(
             "gateway.kanban.wake.message",
             task_id=sub["task_id"], status=_status, title=self.title,
-            assignee=task.assignee if task else "", board=self.board_slug,
+            assignee=self.assignee_label, board=self.board_slug,
         )
         # Label as an automatic notification and carry the handoff so the
         # creator inspects the board instead of re-decomposing.

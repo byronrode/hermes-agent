@@ -542,8 +542,12 @@ def test_pr_state_cache_is_profile_scoped_and_network_bounded(kanban_home, monke
     assert len(calls) == 8
     assert all(call[2] == 2 for call in calls)
     clock[0] += 61
+    assert pr_acceptance.respawn_pr_state("https://github.com/example/repo/pull/8") == "merged"
     assert pr_acceptance.respawn_pr_state(url) == "merged"
     assert len(calls) == 9
+    clock[0] += 240
+    assert pr_acceptance.respawn_pr_state(url) == "merged"
+    assert len(calls) == 10
 
 
 def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(

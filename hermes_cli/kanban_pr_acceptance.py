@@ -54,7 +54,9 @@ def respawn_pr_state(url: str) -> str | None:
         # API stderr and credentials must not enter task records.
         state = None
     with _STATE_LOCK:
-        _STATE_CACHE[key] = (time.monotonic() + 60, state)
+        # Longer than the lookup budget window: an ordered board must advance
+        # past the first batch on its next tick instead of starving later PRs.
+        _STATE_CACHE[key] = (time.monotonic() + 300, state)
     return state
 
 

@@ -26,6 +26,17 @@ def _isolate(tmp_path, monkeypatch):
 
 class TestDynamicRouteLoading:
 
+    def test_invalid_durable_policy_is_rejected_on_startup_and_reload(self, tmp_path):
+        adapter = _make_adapter()
+        invalid = {"secret": "dynamic-secret", "script_failure_policy": "retryy"}
+        with pytest.raises(ValueError, match="script_failure_policy"):
+            adapter._validate_route("durable", invalid)
+        (tmp_path / _DYNAMIC_ROUTES_FILENAME).write_text(json.dumps({"durable": invalid,
+            "valid": {**invalid, "script_failure_policy": "retry"}}))
+        adapter._reload_dynamic_routes()
+        assert "durable" not in adapter._routes
+        assert adapter._routes["valid"]["script_failure_policy"] == "retry"
+
     def test_loads_dynamic_routes(self, tmp_path):
         subs = {"my-hook": {"secret": "dynamic-secret", "prompt": "test", "events": []}}
         (tmp_path / _DYNAMIC_ROUTES_FILENAME).write_text(json.dumps(subs))
@@ -77,5 +88,4 @@ class TestDynamicRouteSecretValidation:
         adapter = _make_adapter()  # global secret set
         adapter._reload_dynamic_routes()
         assert "valid" in adapter._routes
-
 

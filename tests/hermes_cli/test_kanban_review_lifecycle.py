@@ -43,7 +43,8 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(pr_acceptance, "_STATE_CACHE", {})
-    monkeypatch.setattr(pr_acceptance, "_STATE_LOOKUPS", [])
+    monkeypatch.setattr(pr_acceptance, "_STATE_LOOKUPS", {})
+    monkeypatch.setattr(pr_acceptance, "_STATE_PENDING", {})
     monkeypatch.setattr(pr_acceptance, "_api", lambda *a, **k: {"state": "open", "merged": False})
     kb.init_db()
     return home
@@ -536,18 +537,28 @@ def test_pr_state_cache_is_profile_scoped_and_network_bounded(kanban_home, monke
     monkeypatch.setenv("HERMES_HOME", str(kanban_home))
     assert pr_acceptance.respawn_pr_state(url) == "merged"
     assert len(calls) == 2
-    for number in range(2, 8):
+    for number in range(2, 9):
         assert pr_acceptance.respawn_pr_state(f"https://github.com/example/repo/pull/{number}") == "merged"
-    assert pr_acceptance.respawn_pr_state("https://github.com/example/repo/pull/8") is None
-    assert len(calls) == 8
+    assert pr_acceptance.respawn_pr_state("https://github.com/example/repo/pull/9") is None
+    assert len(calls) == 9
     assert all(call[2] == 2 for call in calls)
     clock[0] += 61
-    assert pr_acceptance.respawn_pr_state("https://github.com/example/repo/pull/8") == "merged"
-    assert pr_acceptance.respawn_pr_state(url) == "merged"
-    assert len(calls) == 9
-    clock[0] += 240
+    assert pr_acceptance.respawn_pr_state("https://github.com/example/repo/pull/9") == "merged"
     assert pr_acceptance.respawn_pr_state(url) == "merged"
     assert len(calls) == 10
+    clock[0] += 240
+    assert pr_acceptance.respawn_pr_state(url) == "merged"
+    assert len(calls) == 11
+    # Larger than a cache window: deterministic board order must still
+    # reach late cards rather than repeatedly refreshing the first batches.
+    pr_acceptance._STATE_CACHE.clear()
+    pr_acceptance._STATE_LOOKUPS.clear()
+    pr_acceptance._STATE_PENDING.clear()
+    for _ in range(7):
+        for number in range(1, 50):
+            pr_acceptance.respawn_pr_state(f"https://github.com/example/repo/pull/{number}")
+        clock[0] += 61
+    assert any(call[1].endswith("/pulls/49") for call in calls)
 
 
 def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(

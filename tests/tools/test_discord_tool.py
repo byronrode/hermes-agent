@@ -304,10 +304,13 @@ class TestArchiveThread:
     def test_only_verified_thread_archive_reports_success(self, request, monkeypatch, channel_type, archived, confirmed):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        monkeypatch.setattr("tools.discord_tool._detect_capabilities_nonblocking", lambda token: {})
         before = {"id": "800", "type": channel_type, "thread_metadata": {"archived": archived}}
         after = {**before, "thread_metadata": {"archived": confirmed}}
         request.side_effect = [before, after]
-        result = json.loads(discord_admin_handler(action="archive_thread", channel_id="800"))
+        from tools.registry import registry
+        result = json.loads(registry.dispatch("discord_admin", {"action": "archive_thread", "channel_id": "800"}))
+        assert "archive_thread" not in json.dumps(get_dynamic_schema_core())
         assert bool(result.get("success")) is (channel_type in {10, 11, 12} and confirmed)
         assert request.call_args_list[0].args == ("GET", "/channels/800", "test-token")
         if channel_type == 0 or archived:

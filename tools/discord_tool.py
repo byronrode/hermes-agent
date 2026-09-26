@@ -497,7 +497,7 @@ _TOOL_DESCRIPTIONS = {
 
 _SCHEMA_PROPERTIES: Dict[str, Any] = {
     "guild_id": {"type": "string", "description": "Discord server (guild) ID."},
-    "channel_id": {"type": "string", "description": "Discord channel ID (thread ID for archive_thread)."},
+    "channel_id": {"type": "string", "description": "Discord channel ID."},
     "user_id": {"type": "string", "description": "Discord user ID."},
     "role_id": {"type": "string", "description": "Discord role ID."},
     "message_id": {"type": "string", "description": "Discord message ID."},

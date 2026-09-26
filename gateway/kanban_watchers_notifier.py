@@ -586,8 +586,13 @@ class _KanbanNotification:
         # i18n keys: gateway.kanban.wake.<kind> for each _WAKE_KINDS entry.
         _parts = [t(f"gateway.kanban.wake.{k}") for k in _WAKE_KINDS if k in self.wake_kinds]
         _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
-        synth = t(
-            "gateway.kanban.wake.message",
+        template = t("gateway.kanban.wake.message")
+        if not self.assignee_label:
+            # Remove the translated optional row before formatting; neither
+            # English wording nor an internal profile identifier is a fallback.
+            template = "\n".join(line for line in template.splitlines()
+                                 if "{assignee}" not in line)
+        synth = template.format(
             task_id=sub["task_id"], status=_status, title=self.title,
             assignee=self.assignee_label, board=self.board_slug,
         )

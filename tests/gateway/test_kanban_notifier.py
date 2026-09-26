@@ -44,6 +44,18 @@ def test_unknown_public_assignee_omits_internal_identifier(tmp_path, monkeypatch
     assert _public_assignee_label("rhea") == ""
     assert _public_assignee_label("../private-profile") == ""
     assert _public_assignee_label(None) == ""
+    from gateway.kanban_watchers_notifier import _KanbanNotification
+    for mode in ("notify+wake", "wake"):
+        task = SimpleNamespace(title="Repair", assignee="rhea", session_id="worker-session")
+        notification = _KanbanNotification(SimpleNamespace(), {"task": task,
+            "sub": {"platform": "whatsapp", "task_id": "t_existing", "chat_id": "chat",
+                    "delivery_mode": mode}, "events": [SimpleNamespace(kind="completed")]},
+            platform_cls=Platform, sub_fail_counts={})
+        notification.build_wake_text()
+        assert "Assignee:" not in notification.synth
+        assert "rhea" not in notification.head + notification.synth
+        assert "Title: Repair" in notification.synth
+        assert task.assignee == "rhea"
 
 
 class RecordingAdapter:

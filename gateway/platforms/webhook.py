@@ -217,7 +217,11 @@ class WebhookAdapter(BasePlatformAdapter):
                                  f"exclusive: deliver_only pushes the rendered template as a message, cron_job fires "
                                  f"an existing cron job (which handles its own delivery).")
         validate_coalesce_config(name, route)
-        if route.get("script_failure_policy", "ignore") not in {"ignore", "retry"}:
+        self._validate_script_failure_policy(name, route)
+
+    @staticmethod
+    def _validate_script_failure_policy(name: str, route: dict) -> None:
+        if route.get("script_failure_policy", "ignore") not in ("ignore", "retry"):
             raise ValueError(f"[webhook] Route '{name}' has invalid script_failure_policy")
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -373,6 +377,7 @@ class WebhookAdapter(BasePlatformAdapter):
         try:
             # Hot-reloaded from the request handler: a malformed block must skip the route, not 500 the request.
             validate_coalesce_config(name, route)
+            self._validate_script_failure_policy(name, route)
         except ValueError as e:
             logger.warning("[webhook] Dynamic route '%s' skipped: %s", name, e)
             return False

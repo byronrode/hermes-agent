@@ -79,7 +79,7 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Within this window a GitHub PR URL in a comment blocks re-spawn.
+# Within this window linked PRs need current state evidence before re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
@@ -1503,11 +1503,12 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
+    (verified open PR in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
     PR). The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
-    passes own those.
+    passes own those. Unavailable PR evidence returns ``"pr_state_unknown"``;
+    verified merged/closed links do not hold unfinished work.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1598,7 +1599,8 @@ def check_respawn_guard(
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
-        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+        links = list(_RESPAWN_GUARD_PR_URL_RE.finditer(body)) if body else []
+        if not links:
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
@@ -1609,7 +1611,13 @@ def check_respawn_guard(
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
-        return "active_pr"
+        from hermes_cli.kanban_pr_acceptance import respawn_pr_state
+        for link in links:
+            state = respawn_pr_state(link.group(0))
+            if state == "open":
+                return "active_pr"
+            if state is None:
+                return "pr_state_unknown"
 
     return None
 

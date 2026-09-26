@@ -8,10 +8,54 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
+import time
 from urllib.parse import quote
+
+from hermes_constants import hermes_home_key
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+_STATE_CACHE = {}
+_STATE_LOOKUPS = []
+_STATE_LOCK = threading.Lock()
+
+
+def respawn_pr_state(url: str) -> str | None:
+    """Read bounded live PR evidence; unknown evidence never authorizes a duplicate.
+
+    At most eight two-second lookups per process per minute keep large boards
+    from monopolizing the dispatcher. Cache scope follows the active profile.
+    This is dispatch evidence only, never a completion or release receipt.
+    """
+    match = _PR.fullmatch(url)
+    if not match:
+        return None
+    now = time.monotonic()
+    key = (hermes_home_key(), url)
+    with _STATE_LOCK:
+        expired = [k for k, (until, _) in _STATE_CACHE.items() if until <= now]
+        for stale in expired:
+            del _STATE_CACHE[stale]
+        if key in _STATE_CACHE:
+            return _STATE_CACHE[key][1]
+        _STATE_LOOKUPS[:] = [t for t in _STATE_LOOKUPS if now - t < 60]
+        if len(_STATE_LOOKUPS) >= 8:
+            return None
+        _STATE_LOOKUPS.append(now)
+    state = None
+    try:
+        pr = _api(f"repos/{match[1]}/pulls/{match[2]}", timeout=2)
+        if pr.get("state") == "open":
+            state = "open"
+        elif pr.get("state") == "closed" and isinstance(pr.get("merged"), bool):
+            state = "merged" if pr["merged"] else "closed"
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError):
+        # API stderr and credentials must not enter task records.
+        state = None
+    with _STATE_LOCK:
+        _STATE_CACHE[key] = (time.monotonic() + 60, state)
+    return state
 
 
 def validate_contract(value: str | None) -> str:
@@ -22,14 +66,14 @@ def validate_contract(value: str | None) -> str:
     return value
 
 
-def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
+def _api(endpoint: str, *, query: str | None = None, paginate: bool = False, timeout: float = 30):
     command = ["gh", "api", endpoint, "--hostname", "github.com"]
     if query is not None:
         command += ["-f", "query=" + query]
     if paginate:
         command += ["--paginate", "--slurp"]
     result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                            text=True, timeout=30, check=True)
+                            text=True, timeout=timeout, check=True)
     value = json.loads(result.stdout)
     if isinstance(value, dict) and value.get("errors"):
         raise ValueError("GitHub returned incomplete GraphQL evidence")

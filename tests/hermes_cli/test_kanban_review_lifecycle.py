@@ -32,6 +32,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_ops
+from hermes_cli import kanban_pr_acceptance as pr_acceptance
 
 
 @pytest.fixture
@@ -41,6 +42,9 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(pr_acceptance, "_STATE_CACHE", {})
+    monkeypatch.setattr(pr_acceptance, "_STATE_LOOKUPS", [])
+    monkeypatch.setattr(pr_acceptance, "_api", lambda *a, **k: {"state": "open", "merged": False})
     kb.init_db()
     return home
 
@@ -491,6 +495,55 @@ def _backdate_comments(conn, tid, seconds=60):
             "UPDATE task_comments SET created_at = created_at - ? WHERE task_id = ?",
             (seconds, tid),
         )
+
+
+@pytest.mark.parametrize("state,merged,expected", [
+    ("open", False, "active_pr"),
+    ("closed", True, None),
+    ("closed", False, None),
+    ("unavailable", False, "pr_state_unknown"),
+])
+def test_pr_guard_requires_current_pr_state(kanban_home, monkeypatch, state, merged, expected):
+    def api(endpoint, **kwargs):
+        if state == "unavailable":
+            raise ValueError("unavailable")
+        return {"state": state, "merged": merged}
+
+    monkeypatch.setattr(pr_acceptance, "_api", api)
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="unfinished acceptance", assignee="worker")
+        independent = kb.create_task(conn, title="independent work", assignee="worker")
+        kb.add_comment(conn, task, author="worker", body="https://github.com/example/repo/pull/123")
+        assert kbd.check_respawn_guard(conn, task) == expected
+        assert kbd.check_respawn_guard(conn, independent) is None
+        assert kb.get_task(conn, task).status != "done"
+
+
+def test_pr_state_cache_is_profile_scoped_and_network_bounded(kanban_home, monkeypatch, tmp_path):
+    calls = []
+    clock = [100.0]
+    monkeypatch.setattr(pr_acceptance.time, "monotonic", lambda: clock[0])
+
+    def api(endpoint, **kwargs):
+        calls.append((os.environ["HERMES_HOME"], endpoint, kwargs["timeout"]))
+        return {"state": "closed", "merged": True}
+
+    monkeypatch.setattr(pr_acceptance, "_api", api)
+    url = "https://github.com/example/repo/pull/1"
+    assert pr_acceptance.respawn_pr_state(url) == "merged"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-b"))
+    assert pr_acceptance.respawn_pr_state(url) == "merged"
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home))
+    assert pr_acceptance.respawn_pr_state(url) == "merged"
+    assert len(calls) == 2
+    for number in range(2, 8):
+        assert pr_acceptance.respawn_pr_state(f"https://github.com/example/repo/pull/{number}") == "merged"
+    assert pr_acceptance.respawn_pr_state("https://github.com/example/repo/pull/8") is None
+    assert len(calls) == 8
+    assert all(call[2] == 2 for call in calls)
+    clock[0] += 61
+    assert pr_acceptance.respawn_pr_state(url) == "merged"
+    assert len(calls) == 9
 
 
 def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(

@@ -3953,6 +3953,13 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         if _task_status(conn, task_id) != "archived":
             return False
+        workspace = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if workspace["workspace_kind"] in {"scratch", "worktree"}:
+            path = Path(workspace["workspace_path"] or (workspaces_root() / task_id))
+            if path.exists() or path.is_symlink():
+                raise RuntimeError("purge refused: managed workspace retained; reconcile it with kanban gc first")
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1

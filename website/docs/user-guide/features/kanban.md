@@ -403,6 +403,8 @@ claimed, worker-bound or dependency-linked records; it never terminates a worker
 workspace. Add `--if-body-sha256 <digest>` for one exact reviewed task body.
 A changed body refuses the archive. These guards cannot be used with `--rm`.
 Archiving a duplicate record is not evidence that its user requirement is complete.
+Purging an archived record refuses a retained managed scratch/worktree workspace.
+Reconcile it through the existing `kanban gc` safety checks before removing metadata.
 
 :::note Where an unblocked task lands
 `unblock` restores the safe source phase: **`review`** for reviewer-origin work

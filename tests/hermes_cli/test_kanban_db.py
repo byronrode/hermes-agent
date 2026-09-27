@@ -2030,7 +2030,7 @@ def test_idle_archive_cli_binds_body_and_preserves_workspace(kanban_home, tmp_pa
     artifact = workspace / "keep.txt"
     artifact.write_text("User work")
     with kbc.connect() as conn:
-        task_id = kb.create_task(conn, title="Correction", body="Original source", workspace_path=str(workspace))
+        task_id = kb.create_task(conn, title="Correction", body="Original source", workspace_kind="scratch", workspace_path=str(workspace))
     wrong = hashlib.sha256(b"different source").hexdigest()
     result = run_slash(f"archive {task_id} --idle-only --if-body-sha256 {wrong}")
     assert "body changed" in result
@@ -2042,6 +2042,10 @@ def test_idle_archive_cli_binds_body_and_preserves_workspace(kanban_home, tmp_pa
     with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).status == "archived"
         assert kb.get_task(conn, task_id).body == "Original source"
+    assert artifact.read_text() == "User work"
+    assert "managed workspace retained" in run_slash(f"archive --rm {task_id}")
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "archived"
     assert artifact.read_text() == "User work"
 
 

@@ -140,12 +140,27 @@ class GatewayProfileReconcileMixin:
         sigs = self._served_profile_signatures or {}
         claimed = self._live_resource_claims(active)
         transient_failed = set()
+        deferred_changed = set()
         for name in added + changed:
             # Only acknowledge the configuration observed before connecting;
             # a setup save during an awaited handshake needs another scan.
             scan_signature = profile_serve_signature(current[name])
             try:
-                connected = await self._start_one_profile_adapters(name, current[name], claimed)
+                if name in changed:
+                    # Validate/hydrate before replacing healthy transports. A transient
+                    # secret/config read must leave the previous connection available.
+                    config = await self._load_secondary_profile_config(name, current[name])
+                    adapters = (getattr(self, "_profile_adapters", None) or {}).get(name, {})
+                    reconnecting = bool(adapters)
+                    if any(getattr(adapter, "_active_sessions", None) for adapter in adapters.values()):
+                        deferred_changed.add(name)
+                        continue  # retain the old signature; retry after its reply finishes
+                    await self._disconnect_profile_adapters(name, current[name])
+                    claimed = self._live_resource_claims(active)
+                    connected = await self._start_one_profile_adapters(
+                        name, current[name], claimed, profile_cfg=config, is_reconnect=reconnecting)
+                else:
+                    connected = await self._start_one_profile_adapters(name, current[name], claimed)
             except MultiplexConfigError as exc:
                 logger.error("[MULTIPLEX] Profile '%s' not served: %s", name, exc)
                 connected = 0
@@ -177,6 +192,8 @@ class GatewayProfileReconcileMixin:
             configs = getattr(self, "_profile_configs", None)
             if isinstance(configs, dict):
                 configs.pop(name, None)
+        for name in deferred_changed:
+            self._served_profile_signatures.pop(name, None)
         if added:
             await self._after_profiles_added([(n, current[n]) for n in added])
         result["served_profiles"] = self.served_profile_names()
@@ -211,6 +228,24 @@ class GatewayProfileReconcileMixin:
             except Exception:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 
+    async def _disconnect_profile_adapters(self, name: str, home: "Path") -> None:
+        """Release a changed profile's transports before rebuilding their cached settings.
+
+        Keep session and agent state: a settings save is not a profile removal.
+        Cancel old reconnects first so they cannot restore an adapter with stale gates.
+        """
+        from gateway.run import _profile_runtime_scope
+        pending = (getattr(self, "_profile_failed_platforms", None) or {}).pop(name, None) or {}
+        tasks = [t for t in pending.values() if isinstance(t, asyncio.Task) and not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=self._adapter_disconnect_timeout_secs())
+        with _profile_runtime_scope(Path(home), hydrate_secrets=False):
+            adapters = (getattr(self, "_profile_adapters", None) or {}).pop(name, None) or {}
+            for platform, adapter in list(adapters.items()):
+                await self._bounded_adapter_teardown(adapter, platform, profile=name)
+
     async def _unserve_profile(self, name: str, home: "Path") -> None:
         """Stop and unroute one profile: cancel its reconnects, tear down its adapters, drop its
         bookkeeping and release this process's handles into its home so the deleter's rmtree succeeds.
@@ -223,16 +258,9 @@ class GatewayProfileReconcileMixin:
         profile's). Secrets are not re-hydrated: teardown must not block the loop on a source fetch.
         """
         from gateway.run import _profile_runtime_scope, _write_runtime_status_quiet
-        pending = (getattr(self, "_profile_failed_platforms", None) or {}).pop(name, None) or {}
-        tasks = [t for t in pending.values() if isinstance(t, asyncio.Task) and not t.done()]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.wait(tasks, timeout=self._adapter_disconnect_timeout_secs())
+        adapter_count = len((getattr(self, "_profile_adapters", None) or {}).get(name, {}))
+        await self._disconnect_profile_adapters(name, home)
         with _profile_runtime_scope(Path(home), hydrate_secrets=False):
-            adapters = (getattr(self, "_profile_adapters", None) or {}).pop(name, None) or {}
-            for platform, adapter in list(adapters.items()):
-                await self._bounded_adapter_teardown(adapter, platform, profile=name)
             # Its ``<name>:<platform>`` runtime entries describe a profile that no longer exists.
             _write_runtime_status_quiet(drop_profile_platforms=name)
             for attr in ("pairing_stores", "_busy_text_modes_by_profile", "_busy_input_modes_by_profile",
@@ -256,7 +284,7 @@ class GatewayProfileReconcileMixin:
             with _log_suppressed(logging.DEBUG, "memory-store release failed", exc_info=True):
                 from plugins.memory.holographic.store import MemoryStore
                 MemoryStore.release_all_under(home)
-            logger.info("[MULTIPLEX] Profile '%s' unserved — %d adapter(s) stopped and unrouted", name, len(adapters))
+            logger.info("[MULTIPLEX] Profile '%s' unserved — %d adapter(s) stopped and unrouted", name, adapter_count)
 
 
 def _profile_lifecycle_verb(runner, *, serve: bool):

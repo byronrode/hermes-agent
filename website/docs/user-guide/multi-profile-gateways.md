@@ -732,6 +732,18 @@ one-credential-one-poller rule still applies: a
 hot-added profile that reuses another profile's token is parked with a
 `duplicate_credential` error, never started as a second poller.
 
+Changing a served secondary profile's `config.yaml` or `.env` reconnects that
+profile's adapters with the new settings on the next rescan. Messaging settings
+Save requests this immediately; the periodic rescan is the fallback. This includes
+allowlist changes and disabling a platform. The old transports and their pending
+reconnects are stopped before replacements connect, preserving the profile's
+session and agent state and leaving other profiles' transports alone. The launch
+profile still needs its normal gateway restart for adapter configuration changes.
+Replacement settings are validated before disconnecting healthy transports. A
+profile with an active messaging reply waits for that reply to finish before
+reconnecting; saved settings remain pending for the next rescan. Reconnection
+preserves queued server-side updates rather than applying cold-start queue policy.
+
 ### Routing shared-bot chats to profiles (`profile_routes`)
 
 Multiplexing selects a profile per **credential** (each profile's own bot

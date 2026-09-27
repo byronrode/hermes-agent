@@ -8,7 +8,7 @@ profiles' live adapters. The cron ticker's live enumerator is covered in ``tests
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -53,7 +53,7 @@ def _runner(tmp_path, monkeypatch):
     runner._adapter_disconnect_timeout_secs = lambda: 0.5
     started = []
 
-    async def _start(profile_name, profile_home, claimed):
+    async def _start(profile_name, profile_home, claimed, **kwargs):
         started.append(profile_name)
         token = (profile_home / ".env").read_text(encoding="utf-8") if (profile_home / ".env").exists() else ""
         if "DISCORD_BOT_TOKEN" not in token:
@@ -78,6 +78,85 @@ def _mkprofile(home, name, env=""):
 def _served_record(home):
     flush_runtime_status()
     return json.loads((home / "gateway_state.json").read_text(encoding="utf-8")).get("served_profiles")
+
+
+@pytest.fixture
+def multiplex_mode():
+    from agent.secret_scope import set_multiplex_active
+    yield set_multiplex_active
+    set_multiplex_active(False)
+
+
+@pytest.mark.asyncio
+async def test_settings_save_replaces_live_transport_and_preserves_other_profile_and_session(tmp_path, monkeypatch, multiplex_mode):
+    from plugins.platforms.discord.adapter import DiscordAdapter
+    runner, home = _runner(tmp_path, monkeypatch)
+    multiplex_mode(True)
+    alpha = _mkprofile(home, "alpha", "DISCORD_BOT_TOKEN=alpha\n")
+    beta = _mkprofile(home, "beta", "DISCORD_BOT_TOKEN=beta\n")
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        await runner._start_secondary_profile_adapters()
+        old = runner._profile_adapters["beta"][Platform.DISCORD]
+        other = runner._profile_adapters["alpha"][Platform.DISCORD]
+        session = object()
+        runner._agent_cache["agent:beta:discord:dm:owner"] = session
+        # Exercise the real startup guard which used to skip the existing adapter.
+        runner._start_one_profile_adapters = GatewayRunner._start_one_profile_adapters.__get__(runner)
+        runner._register_config_hooks = lambda *a, **kw: None
+        runner._busy_text_modes_by_profile, runner._busy_input_modes_by_profile = {}, {}
+        runner._adapter_credential_claim = lambda *args: None
+        runner._adapter_listener_claim = lambda *args: None
+        runner._create_adapter = lambda platform, config: DiscordAdapter(config)
+        runner._configure_profile_adapter = lambda *args: None
+        runner._connect_initial_adapter_with_timeout = AsyncMock(return_value=True)
+        async def connect(adapter, platform, *, is_reconnect):
+            assert is_reconnect is True
+            adapter._snapshot_gate_env()
+            adapter._allowed_user_ids = adapter._get_allowed_users()
+            return True
+        runner._connect_adapter_with_timeout = AsyncMock(side_effect=connect)
+        runner._sync_voice_mode_state_to_adapter = lambda adapter: None
+        monkeypatch.setattr("gateway.run._platform_has_bot_credential", lambda *args: True)
+        (alpha / ".env").write_text("DISCORD_BOT_TOKEN=alpha\nDISCORD_ALLOWED_USERS=111111111111111111\n")
+        # Establish alpha's new signature before changing beta, then retain its transport.
+        runner._served_profile_signatures["alpha"] = profile_serve_signature(alpha)
+        (beta / ".env").write_text("DISCORD_BOT_TOKEN=beta\nDISCORD_ALLOWED_USERS=222222222222222222\n")
+        result = await runner.reconcile_served_profiles()
+        assert result["rescanned"] == ["beta"]
+        assert old.disconnected and old.cancelled
+        assert runner._profile_adapters["beta"][Platform.DISCORD] is not old
+        replacement = runner._profile_adapters["beta"][Platform.DISCORD]
+        assert replacement._is_allowed_user("222222222222222222", is_dm=True)
+        assert not replacement._is_allowed_user("111111111111111111", is_dm=True)
+        assert runner._profile_adapters["alpha"][Platform.DISCORD] is other
+        assert not other.disconnected
+        assert runner._agent_cache["agent:beta:discord:dm:owner"] is session
+        runner._connect_adapter_with_timeout.assert_awaited_once()
+        assert runner._connect_adapter_with_timeout.await_args.kwargs == {"is_reconnect": True}
+        assert profile_serve_signature(alpha) == runner._served_profile_signatures["alpha"]
+        assert (await runner.reconcile_served_profiles())["rescanned"] == []
+
+
+@pytest.mark.asyncio
+async def test_failed_replacement_read_keeps_live_transport_and_retries(tmp_path, monkeypatch):
+    runner, home = _runner(tmp_path, monkeypatch)
+    beta = _mkprofile(home, "beta", "DISCORD_BOT_TOKEN=beta\n")
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        await runner._start_secondary_profile_adapters()
+        old = runner._profile_adapters["beta"][Platform.DISCORD]
+        runner._load_secondary_profile_config = AsyncMock(side_effect=OSError("secret source unavailable"))
+        (beta / ".env").write_text("DISCORD_BOT_TOKEN=beta\nDISCORD_ALLOWED_USERS=owner\n")
+        await runner.reconcile_served_profiles()
+        assert runner._profile_adapters["beta"][Platform.DISCORD] is old
+        assert not old.disconnected
+        assert "beta" not in runner._served_profile_signatures
+        runner._load_secondary_profile_config = AsyncMock(return_value=GatewayConfig())
+        old._active_sessions = {"owner": object()}
+        assert (await runner.reconcile_served_profiles())["rescanned"] == []
+        assert not old.disconnected
+        old._active_sessions.clear()
+        assert (await runner.reconcile_served_profiles())["rescanned"] == ["beta"]
+        assert old.disconnected
 
 
 @pytest.mark.asyncio
@@ -265,11 +344,11 @@ async def test_transient_start_failure_is_retried_on_next_reconcile(tmp_path, mo
         attempts = []
         real_start = runner._start_one_profile_adapters
 
-        async def flaky(name, profile_home, claimed):
+        async def flaky(name, profile_home, claimed, **kwargs):
             attempts.append(name)
             if len(attempts) == 1:
                 raise OSError("secret backend unreachable")
-            return await real_start(name, profile_home, claimed)
+            return await real_start(name, profile_home, claimed, **kwargs)
 
         runner._start_one_profile_adapters = flaky
         first = await runner.reconcile_served_profiles()

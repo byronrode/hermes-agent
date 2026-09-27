@@ -3879,7 +3879,8 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
+def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None,
+                 idle_only: bool = False, expected_body_sha256: Optional[str] = None) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
 
     Clearing ``worker_pid`` in the DB alone left the OS process running past its
@@ -3893,13 +3894,25 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     termination outcome lands as its own ``archive_worker_termination`` event so
     the ``archived`` event stays atomic with the status flip.
     """
+    if expected_body_sha256 is not None:
+        import hashlib
+        if not idle_only or not re.fullmatch(r"[a-f0-9]{64}", expected_body_sha256):
+            raise ValueError("body digest requires idle-only archive and an exact SHA256")
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, claim_lock, worker_pid, worker_started_at, body FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row:
             return False
+        if idle_only and (row["status"] == "running" or row["claim_lock"] is not None or row["worker_pid"] is not None):
+            raise RuntimeError("idle-only archive refused: task has execution ownership")
+        if idle_only and conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? LIMIT 1", (task_id, task_id)
+        ).fetchone():
+            raise RuntimeError("idle-only archive refused: task has dependency edges")
+        if expected_body_sha256 is not None and hashlib.sha256((row["body"] or "").encode()).hexdigest() != expected_body_sha256:
+            raise RuntimeError("idle-only archive refused: task body changed")
         was_running = row["status"] == "running"
         prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
         cur = conn.execute(
@@ -3922,7 +3935,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     # ``archived`` parents no longer block children; promote them now.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
-    _cleanup_workspace(conn, task_id)
+    if not idle_only:
+        _cleanup_workspace(conn, task_id)
     return True
 
 
@@ -3939,6 +3953,13 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         if _task_status(conn, task_id) != "archived":
             return False
+        workspace = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if workspace["workspace_kind"] in {"scratch", "worktree"}:
+            path = Path(workspace["workspace_path"] or (workspaces_root() / task_id))
+            if path.exists() or path.is_symlink():
+                raise RuntimeError("purge refused: managed workspace retained; reconcile it with kanban gc first")
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1

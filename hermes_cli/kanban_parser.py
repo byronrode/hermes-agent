@@ -356,6 +356,8 @@ _SPECS = [
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
+        _arg("--idle-only", action="store_true", help="Refuse execution-owned tasks atomically; retain their workspace"),
+        _arg("--if-body-sha256", help="Archive one idle task only if its body still has this exact SHA256"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
     ], help="Archive one or more tasks"),

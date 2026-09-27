@@ -397,6 +397,13 @@ hermes kanban unblock  t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
+For metadata reconciliation, use `archive t_abc --idle-only`. The command
+checks execution ownership inside the archive transaction and refuses running,
+claimed, worker-bound or dependency-linked records; it never terminates a worker or removes its
+workspace. Add `--if-body-sha256 <digest>` for one exact reviewed task body.
+A changed body refuses the archive. These guards cannot be used with `--rm`.
+Archiving a duplicate record is not evidence that its user requirement is complete.
+
 :::note Where an unblocked task lands
 `unblock` restores the safe source phase: **`review`** for reviewer-origin work
 whose parents are complete, **`ready`** for implementation work whose parents

@@ -2003,6 +2003,48 @@ def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
         assert kb.get_task(conn, t).status == "archived"
 
 
+@pytest.mark.parametrize("ownership", ["running", "claim", "worker", "dependency"])
+def test_idle_archive_preserves_execution_ownership(kanban_home, ownership):
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="Correction", body="Preserved requirement")
+        if ownership == "dependency":
+            parent = kb.create_task(conn, title="Existing parent")
+            kb.link_tasks(conn, parent, task_id)
+        else:
+            field, value = {"running": ("status", "running"), "claim": ("claim_lock", "owner"),
+                            "worker": ("worker_pid", 54321)}[ownership]
+            conn.execute(f"UPDATE tasks SET {field} = ? WHERE id = ?", (value, task_id))
+        conn.commit()
+        before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
+        with pytest.raises(RuntimeError, match="dependency edges" if ownership == "dependency" else "execution ownership"):
+            kb.archive_task(conn, task_id, idle_only=True,
+                            signal_fn=lambda *_: pytest.fail("idle reconciliation must never signal workers"))
+        assert dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()) == before
+
+
+def test_idle_archive_cli_binds_body_and_preserves_workspace(kanban_home, tmp_path):
+    import hashlib
+    from hermes_cli.kanban import run_slash
+    workspace = tmp_path / "user-work"
+    workspace.mkdir()
+    artifact = workspace / "keep.txt"
+    artifact.write_text("User work")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="Correction", body="Original source", workspace_path=str(workspace))
+    wrong = hashlib.sha256(b"different source").hexdigest()
+    result = run_slash(f"archive {task_id} --idle-only --if-body-sha256 {wrong}")
+    assert "body changed" in result
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task_id).status != "archived"
+    digest = hashlib.sha256(b"Original source").hexdigest()
+    result = run_slash(f"archive {task_id} --idle-only --if-body-sha256 {digest}")
+    assert f"Archived {task_id}" in result
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "archived"
+        assert kb.get_task(conn, task_id).body == "Original source"
+    assert artifact.read_text() == "User work"
+
+
 def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
     """A never-claimed (``triage``/``ready``/``done``) task has no live worker:
     ``archive_task`` must not signal anything, and no termination event is

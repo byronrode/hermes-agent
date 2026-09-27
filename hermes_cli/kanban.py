@@ -1125,11 +1125,15 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         return _err("choose either task_ids to archive or --rm archived task_ids")
     if not ids and not purge_ids:
         return _err("at least one task_id is required")
+    idle_only = getattr(args, "idle_only", False)
+    body_sha = getattr(args, "if_body_sha256", None)
+    if (purge_ids and (idle_only or body_sha)) or (body_sha and (not idle_only or len(ids) != 1)):
+        return _err("body digest requires one idle-only archive; archive guards cannot be used with --rm")
     with kbc.connect_closing() as conn:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
+        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid, idle_only=idle_only, expected_body_sha256=body_sha),
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
 

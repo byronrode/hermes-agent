@@ -137,17 +137,30 @@ class GatewayProfileReconcileMixin:
         for name in removed:
             await self._unserve_profile(name, self._served_profile_homes[name])
             result["removed"].append(name)
-        for name in changed:
-            await self._disconnect_profile_adapters(name, current[name])
         sigs = self._served_profile_signatures or {}
         claimed = self._live_resource_claims(active)
         transient_failed = set()
+        deferred_changed = set()
         for name in added + changed:
             # Only acknowledge the configuration observed before connecting;
             # a setup save during an awaited handshake needs another scan.
             scan_signature = profile_serve_signature(current[name])
             try:
-                connected = await self._start_one_profile_adapters(name, current[name], claimed)
+                if name in changed:
+                    # Validate/hydrate before replacing healthy transports. A transient
+                    # secret/config read must leave the previous connection available.
+                    config = await self._load_secondary_profile_config(name, current[name])
+                    adapters = (getattr(self, "_profile_adapters", None) or {}).get(name, {})
+                    reconnecting = bool(adapters)
+                    if any(getattr(adapter, "_active_sessions", None) for adapter in adapters.values()):
+                        deferred_changed.add(name)
+                        continue  # retain the old signature; retry after its reply finishes
+                    await self._disconnect_profile_adapters(name, current[name])
+                    claimed = self._live_resource_claims(active)
+                    connected = await self._start_one_profile_adapters(
+                        name, current[name], claimed, profile_cfg=config, is_reconnect=reconnecting)
+                else:
+                    connected = await self._start_one_profile_adapters(name, current[name], claimed)
             except MultiplexConfigError as exc:
                 logger.error("[MULTIPLEX] Profile '%s' not served: %s", name, exc)
                 connected = 0
@@ -179,6 +192,8 @@ class GatewayProfileReconcileMixin:
             configs = getattr(self, "_profile_configs", None)
             if isinstance(configs, dict):
                 configs.pop(name, None)
+        for name in deferred_changed:
+            self._served_profile_signatures.pop(name, None)
         if added:
             await self._after_profiles_added([(n, current[n]) for n in added])
         result["served_profiles"] = self.served_profile_names()

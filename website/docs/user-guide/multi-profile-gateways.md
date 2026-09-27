@@ -739,6 +739,10 @@ allowlist changes and disabling a platform. The old transports and their pending
 reconnects are stopped before replacements connect, preserving the profile's
 session and agent state and leaving other profiles' transports alone. The launch
 profile still needs its normal gateway restart for adapter configuration changes.
+Replacement settings are validated before disconnecting healthy transports. A
+profile with an active messaging reply waits for that reply to finish before
+reconnecting; saved settings remain pending for the next rescan. Reconnection
+preserves queued server-side updates rather than applying cold-start queue policy.
 
 ### Routing shared-bot chats to profiles (`profile_routes`)
 

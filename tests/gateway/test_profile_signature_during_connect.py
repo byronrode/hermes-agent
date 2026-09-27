@@ -47,7 +47,7 @@ async def test_config_saved_during_connect_is_rescanned(tmp_path, monkeypatch, s
     runner._note_served_profiles([("default", home)])
     connected = []
 
-    async def connect(adapter, platform):
+    async def connect(adapter, platform, **kwargs):
         connected.append(platform)
         if connected == [Platform.DISCORD]:
             # Configuration was already read; a second setup operation finishes while
@@ -62,6 +62,7 @@ async def test_config_saved_during_connect_is_rescanned(tmp_path, monkeypatch, s
         pass
 
     runner._connect_initial_adapter_with_timeout = connect
+    runner._connect_adapter_with_timeout = connect
     runner._after_profiles_added = after_added
     if startup:
         await runner._start_secondary_profile_adapters()

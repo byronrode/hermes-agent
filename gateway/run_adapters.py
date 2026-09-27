@@ -1060,11 +1060,13 @@ class GatewayAdapterLifecycleMixin:
         return lines
 
     async def _start_one_profile_adapters(
-        self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str]
+        self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str],
+        *, profile_cfg=None, is_reconnect: bool = False,
     ) -> int:
         """Create+connect one profile's adapters under its runtime scope."""
         from gateway.run import _platform_has_bot_credential, _profile_runtime_scope
-        profile_cfg = await self._load_secondary_profile_config(profile_name, profile_home)
+        if profile_cfg is None:
+            profile_cfg = await self._load_secondary_profile_config(profile_name, profile_home)
         # Keep the served profile's config: host-wide passes (planned-restart notices) must reach
         # every served profile's home channels, and this is the only place it is loaded.
         configs = getattr(self, "_profile_configs", None)
@@ -1126,7 +1128,9 @@ class GatewayAdapterLifecycleMixin:
             self._configure_profile_adapter(adapter, profile_name, platform)
             try:
                 with _profile_runtime_scope(profile_home, hydrate_secrets=False):
-                    success = await self._connect_initial_adapter_with_timeout(adapter, platform)
+                    success = (await self._connect_adapter_with_timeout(adapter, platform, is_reconnect=True)
+                               if is_reconnect else
+                               await self._connect_initial_adapter_with_timeout(adapter, platform))
                 if not success:
                     logger.warning("✗ %s failed to connect (profile: %s)", platform.value, profile_name)
             except Exception as e:

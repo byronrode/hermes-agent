@@ -8,11 +8,11 @@ profiles' live adapters. The cron ticker's live enumerator is covered in ``tests
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
 from gateway.run_profile_reconcile import profile_serve_signature
 from gateway.status import flush_runtime_status
@@ -78,6 +78,38 @@ def _mkprofile(home, name, env=""):
 def _served_record(home):
     flush_runtime_status()
     return json.loads((home / "gateway_state.json").read_text(encoding="utf-8")).get("served_profiles")
+
+
+@pytest.mark.asyncio
+async def test_settings_save_replaces_live_transport_and_preserves_other_profile_and_session(tmp_path, monkeypatch):
+    runner, home = _runner(tmp_path, monkeypatch)
+    alpha = _mkprofile(home, "alpha", "DISCORD_BOT_TOKEN=alpha\n")
+    beta = _mkprofile(home, "beta", "DISCORD_BOT_TOKEN=beta\n")
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        await runner._start_secondary_profile_adapters()
+        old = runner._profile_adapters["beta"][Platform.DISCORD]
+        other = runner._profile_adapters["alpha"][Platform.DISCORD]
+        session = object()
+        runner._agent_cache["agent:beta:discord:dm:owner"] = session
+        # Exercise the real startup guard which used to skip the existing adapter.
+        runner._start_one_profile_adapters = GatewayRunner._start_one_profile_adapters.__get__(runner)
+        runner._load_secondary_profile_config = AsyncMock(return_value=GatewayConfig(
+            platforms={Platform.DISCORD: PlatformConfig(enabled=True)}))
+        runner._create_adapter = lambda platform, config: _Adapter("updated-beta")
+        runner._configure_profile_adapter = lambda *args: None
+        runner._connect_initial_adapter_with_timeout = AsyncMock(return_value=True)
+        runner._sync_voice_mode_state_to_adapter = lambda adapter: None
+        monkeypatch.setattr("gateway.run._platform_has_bot_credential", lambda *args: True)
+        (beta / ".env").write_text("DISCORD_BOT_TOKEN=beta\nDISCORD_ALLOWED_USERS=owner\n")
+        result = await runner.reconcile_served_profiles()
+        assert result["rescanned"] == ["beta"]
+        assert old.disconnected and old.cancelled
+        assert runner._profile_adapters["beta"][Platform.DISCORD] is not old
+        assert runner._profile_adapters["alpha"][Platform.DISCORD] is other
+        assert not other.disconnected
+        assert runner._agent_cache["agent:beta:discord:dm:owner"] is session
+        assert profile_serve_signature(alpha) == runner._served_profile_signatures["alpha"]
+        assert (await runner.reconcile_served_profiles())["rescanned"] == []
 
 
 @pytest.mark.asyncio

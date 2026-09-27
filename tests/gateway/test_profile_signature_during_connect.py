@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -42,13 +42,14 @@ async def test_config_saved_during_connect_is_rescanned(tmp_path, monkeypatch, s
     runner._restore_secondary_completion_ledgers = lambda *a: None
     runner._adapter_credential_claim = lambda *a: None
     runner._adapter_listener_claim = lambda *a: None
-    runner._create_adapter = lambda platform, config: SimpleNamespace(platform=platform)
+    runner._create_adapter = lambda platform, config: SimpleNamespace(
+        platform=platform, disconnect=AsyncMock(), cancel_background_tasks=AsyncMock())
     runner._note_served_profiles([("default", home)])
     connected = []
 
     async def connect(adapter, platform):
         connected.append(platform)
-        if platform == Platform.DISCORD:
+        if connected == [Platform.DISCORD]:
             # Configuration was already read; a second setup operation finishes while
             # the first adapter is awaiting its transport handshake.
             secrets.write_text(
@@ -68,6 +69,6 @@ async def test_config_saved_during_connect_is_rescanned(tmp_path, monkeypatch, s
         await runner.reconcile_served_profiles()
     assert connected == [Platform.DISCORD]
     await runner.reconcile_served_profiles()
-    assert connected == [Platform.DISCORD, Platform.TELEGRAM]
+    assert sorted(p.value for p in connected) == ["discord", "discord", "telegram"]
     await runner.reconcile_served_profiles()
-    assert connected == [Platform.DISCORD, Platform.TELEGRAM]
+    assert sorted(p.value for p in connected) == ["discord", "discord", "telegram"]

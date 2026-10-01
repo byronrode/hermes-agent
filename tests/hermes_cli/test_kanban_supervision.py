@@ -6,6 +6,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect_closing, init_db
 from hermes_cli.kanban_supervision import handoff_to_supervision, run_handed_to_supervision
 from hermes_cli.kanban_db_dispatch import detect_crashed_workers, detect_stale_running, reconcile_orphaned_running
+from hermes_cli import kanban_db_dispatch as dispatch
 
 
 @pytest.fixture
@@ -71,3 +72,16 @@ def test_plugin_handoff_ends_worker_stop_guard_from_kernel_receipt(conn, monkeyp
     assert build_kanban_stop_nudge(messages=[]) is not None
     assert handoff_to_supervision(conn, task_id, "external:exact", expected_run_id=task.current_run_id)
     assert build_kanban_stop_nudge(messages=[]) is None
+
+
+@pytest.mark.parametrize("cap", ["max_spawn", "max_in_progress", "max_in_progress_per_profile"])
+def test_supervision_does_not_consume_local_worker_capacity(conn, all_assignees_spawnable, cap):
+    supervised = kb.create_task(conn, title="external work", assignee="vera")
+    task = kb.claim_task(conn, supervised)
+    assert handoff_to_supervision(conn, supervised, "external:exact", expected_run_id=task.current_run_id)
+    ready = kb.create_task(conn, title="unrelated ready work", assignee="vera")
+    assert dispatch.count_running_tasks(conn) == 0
+    result = dispatch.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 424242, **{cap: 1})
+    assert [spawn[0] for spawn in result.spawned] == [ready]
+    assert kb.get_task(conn, supervised).status == "running"
+    assert dispatch.count_running_tasks(conn) == 1

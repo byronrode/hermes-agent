@@ -76,9 +76,24 @@ def run_handed_to_supervision(conn, task_id: str, run_id: int) -> bool:
 
 def task_under_supervision(conn, task_id: str) -> bool:
     """A recorded external run deliberately has no local worker claim/heartbeat."""
-    row = conn.execute("""
-        SELECT r.metadata FROM tasks t JOIN task_runs r ON r.id = t.current_run_id
-        WHERE t.id = ? AND t.status = 'running' AND r.status = 'running'
-          AND r.task_id = t.id AND t.claim_lock IS NULL AND t.worker_pid IS NULL
-        """, (task_id,)).fetchone()
-    return bool(row and kb._json_dict(row["metadata"]).get("supervision", {}).get("reference"))
+    row = conn.execute(_RUNNING_TASKS_SQL + " AND t.id = ?", (task_id,)).fetchone()
+    return bool(row and _supervised_row(row))
+
+
+_RUNNING_TASKS_SQL = """
+    SELECT t.id, t.assignee, t.claim_lock, t.worker_pid,
+           r.status AS run_status, r.metadata AS run_metadata
+    FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id
+    WHERE t.status = 'running'
+"""
+
+
+def _supervised_row(row) -> bool:
+    supervision = kb._json_dict(row["run_metadata"]).get("supervision")
+    return (row["run_status"] == "running" and row["claim_lock"] is None and row["worker_pid"] is None
+            and isinstance(supervision, dict) and bool(supervision.get("reference")))
+
+
+def running_local_tasks(conn):
+    """Local concurrency counts preserve legacy rows and exclude durable external runs."""
+    return [row for row in conn.execute(_RUNNING_TASKS_SQL) if not _supervised_row(row)]

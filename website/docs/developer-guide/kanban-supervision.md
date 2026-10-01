@@ -16,6 +16,7 @@ stop guard to recognize this durable kernel receipt without trusting a
 plugin tool name or success-looking text.
 Dispatcher orphan and stale-heartbeat sweeps recognize the active supervision
 run in the ledger and leave it running without spawning another local worker.
+Supervised runs do not consume board, host or per-profile local worker capacity.
 
 The API contains no provider routing or product-specific policy. External
 supervision verification belongs in the consuming plugin. Callers continue to

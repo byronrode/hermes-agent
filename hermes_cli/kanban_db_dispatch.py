@@ -804,6 +804,9 @@ def detect_stale_running(
             continue
 
         with _kb.write_txn(conn):
+            from hermes_cli.kanban_supervision import task_under_supervision
+            if task_under_supervision(conn, tid):
+                continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -870,6 +873,9 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             continue
         with _kb.write_txn(conn):
+            from hermes_cli.kanban_supervision import task_under_supervision
+            if task_under_supervision(conn, tid):
+                continue
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
@@ -1852,18 +1858,15 @@ def configured_max_in_progress() -> Optional[int]:
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
-    """Number of tasks in ``status='running'``.
+    """Number of local worker tasks in ``status='running'``.
 
     Used by the multi-board sweep to count OTHER boards' workers against the
     host-level budget — the memory-derived cap bounds the machine, not the
     board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
     """
     try:
-        return int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
-        )
+        from hermes_cli.kanban_supervision import running_local_tasks
+        return len(running_local_tasks(conn))
     except Exception:
         return 0
 
@@ -2335,12 +2338,10 @@ def _dispatch_once_locked(
     ) else None
     per_profile_running: dict[str, int] = {}
     if per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            per_profile_running[prow["assignee"]] = int(prow["n"])
+        from hermes_cli.kanban_supervision import running_local_tasks
+        for prow in running_local_tasks(conn):
+            if prow["assignee"] is not None:
+                per_profile_running[prow["assignee"]] = per_profile_running.get(prow["assignee"], 0) + 1
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold

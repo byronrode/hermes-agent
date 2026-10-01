@@ -1,6 +1,7 @@
 """Turn-end guard for kanban workers, which must end with a terminal board tool that hands
 the card to whoever owns it next (``kanban_complete``, ``kanban_block``,
-``kanban_request_review``, ``kanban_request_changes``). Some models narrate the next step
+``kanban_request_review``, ``kanban_request_changes``), or a verified kernel supervision
+handoff. Some models narrate the next step
 and stop with no tool calls; Hermes treats that as a clean exit → ``rc=0`` → dispatcher
 ``protocol_violation``. Policy-only: return a bounded synthetic nudge so the loop continues
 instead of exiting.
@@ -75,6 +76,16 @@ def build_kanban_stop_nudge(
         or session_called_kanban_terminal(messages)
     ):
         return None
+
+    # Plugin handoffs are recorded by the kernel, rather than inferred from a
+    # custom tool's name or a successful-looking response in the transcript.
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if run_id and run_id.isdecimal():
+        from hermes_cli.kanban_db_connect import connect_closing
+        from hermes_cli.kanban_supervision import run_handed_to_supervision
+        with connect_closing() as conn:
+            if run_handed_to_supervision(conn, owned_kanban_task(), int(run_id)):
+                return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
     # The transcript is the status source: this text is only reached when the session made no

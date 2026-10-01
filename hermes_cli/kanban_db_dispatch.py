@@ -804,6 +804,9 @@ def detect_stale_running(
             continue
 
         with _kb.write_txn(conn):
+            from hermes_cli.kanban_supervision import task_under_supervision
+            if task_under_supervision(conn, tid):
+                continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -870,6 +873,9 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             continue
         with _kb.write_txn(conn):
+            from hermes_cli.kanban_supervision import task_under_supervision
+            if task_under_supervision(conn, tid):
+                continue
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "

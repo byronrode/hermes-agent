@@ -386,6 +386,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """
         if not isinstance(template, dict) or not template.get("name") or not template.get("language"):
             return SendResult(success=False, error="scheduled_template requires name and language")
+        # Meta rejects newlines, tabs and repeated spaces in template variables.
+        content = " ".join(content.split())
         if len(content) > 1024:
             return SendResult(success=False, error="Template update exceeds 1024 characters; use a concise summary with a link")
         payload = self._outbound_payload(chat_id, "template", {

@@ -1477,7 +1477,8 @@ class TestScheduledTemplates:
         adapter._http_client = MagicMock()
         adapter._http_client.post = AsyncMock(return_value=_mock_httpx_response(
             200, {"messages": [{"id": "wamid.reminder"}]}))
-        result = await adapter.send("15551234567", "Review your notes", metadata={"job_id": "reminder"} if scheduled else {})
+        text = "Review\nyour\tnotes     today"
+        result = await adapter.send("15551234567", text, metadata={"job_id": "reminder"} if scheduled else {})
         assert result.success
         payload = adapter._http_client.post.call_args.kwargs["json"]
         assert payload["to"] == "15551234567"
@@ -1485,10 +1486,10 @@ class TestScheduledTemplates:
         if scheduled:
             assert payload["template"] == {
                 "name": "requested_reminder", "language": {"code": "en"},
-                "components": [{"type": "body", "parameters": [{"type": "text", "text": "Review your notes"}]}],
+                "components": [{"type": "body", "parameters": [{"type": "text", "text": "Review your notes today"}]}],
             }
         else:
-            assert payload["text"]["body"] == "Review your notes"
+            assert payload["text"]["body"] == adapter.format_message(text)
         assert adapter._http_client.post.call_count == 1
 
     @pytest.mark.asyncio

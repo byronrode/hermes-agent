@@ -313,7 +313,7 @@ Meta only allows **free-form messages** within a 24-hour window after the user's
 
 Hermes warns the agent about this window in its system prompt, so the model knows to mention it when scheduling delayed messages.
 
-Scheduled text updates can use an approved template with one body variable. Configure the template in the sending profile:
+Scheduled text updates can use an approved template with one positional body variable (`{{1}}`). Configure the template in the sending profile:
 
 ```yaml
 platforms:
@@ -324,7 +324,7 @@ platforms:
         language: en
 ```
 
-Only cron deliveries carrying a job ID use this template; ordinary conversation replies remain free-form. Meta must approve the template for this WhatsApp account before enabling it. The complete scheduled update is passed as the single body variable, so use a concise summary with a link for updates longer than 1024 characters. Failed template sends remain delivery failures; Hermes does not retry them as ordinary messages or silently cut off the content. These template deliveries may be billable even during an open conversation.
+Only cron deliveries carrying a job ID use this template; ordinary conversation replies remain free-form. Meta must approve the template for this WhatsApp account before enabling it. The scheduled update is flattened to a single line and passed as the single body variable, so use a concise summary with a link for updates longer than 1024 characters. Failed template sends remain delivery failures; Hermes does not retry them as ordinary messages or silently cut off the content. These template deliveries may be billable even during an open conversation.
 
 Asynchronous engineering results and arbitrary webhook notifications still require an open conversation unless delivered through a configured scheduled job.
 

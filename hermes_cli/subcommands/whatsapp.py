@@ -21,4 +21,7 @@ def build_whatsapp_cloud_parser(subparsers, *, cmd_whatsapp_cloud: Callable) -> 
             "adapter (Business account required, public webhook URL "
             "required). Distinct from `hermes whatsapp` which sets up "
             "the Baileys bridge for personal accounts.")
+    whatsapp_cloud_parser.add_argument(
+        "action", nargs="?", choices=("setup", "status", "register"), default="setup",
+        help="Configure credentials, inspect registration, or register using a privately entered PIN")
     whatsapp_cloud_parser.set_defaults(func=cmd_whatsapp_cloud)

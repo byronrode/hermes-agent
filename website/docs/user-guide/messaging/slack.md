@@ -125,6 +125,26 @@ Socket Mode lets the bot connect via WebSocket instead of requiring a public URL
 
 :::tip
 You can always find or regenerate app-level tokens under **Settings → Basic Information → App-Level Tokens**.
+
+### Rotating app-level tokens
+
+If the app-level access token starts with `xoxe.xapp-`, keep the accompanying
+refresh token. Run `hermes gateway setup`, select Slack, and reconfigure it.
+Leave the two access-token prompts blank to retain saved credentials, then
+enter the app refresh token, client ID, and client secret from Basic Information.
+Refresh tokens and client secrets use hidden prompts; never paste them in chat.
+
+Hermes stores this credential set atomically in the owning profile's private
+`auth.json`, preserving other credentials. On connection it establishes an
+expiry, then renews ten minutes before expiry through the existing Socket Mode
+watchdog and reconnects with the renewed access token. Every refresh stores the
+replacement refresh token before using the new connection. Restarting Hermes
+reuses the saved expiry and credentials. Transient renewal failures retry through
+the watchdog without adding a separate process or scheduled AI job.
+
+This supports app-level token rotation; rotating **bot** tokens still require
+separate OAuth installation support. Ordinary `xapp-` tokens need no refresh
+credentials. Slack does not allow disabling rotation after enabling it.
 :::
 
 ---

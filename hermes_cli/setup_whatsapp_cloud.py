@@ -131,6 +131,78 @@ def _prompt_validated(
 
 # --- Wizard
 
+def run_whatsapp_cloud_registration(*, register: bool = False) -> int:
+    """Keep registration credentials out of argv, persisted state and error output."""
+    import getpass
+    import json
+    import urllib.error
+    import urllib.request
+    from hermes_cli.config import get_env_value
+    from gateway.config import Platform, load_gateway_config
+    from gateway.platforms.whatsapp_cloud import DEFAULT_API_VERSION
+
+    phone_id = get_env_value("WHATSAPP_CLOUD_PHONE_NUMBER_ID") or ""
+    token = get_env_value("WHATSAPP_CLOUD_ACCESS_TOKEN") or ""
+    if not _validate_phone_number_id(phone_id)[0] or not token:
+        print("Run hermes whatsapp-cloud setup to save a phone ID and access token first.")
+        return 1
+    platform = load_gateway_config().platforms.get(Platform.WHATSAPP_CLOUD)
+    version = platform.extra.get("api_version", DEFAULT_API_VERSION) if platform else DEFAULT_API_VERSION
+    if not re.fullmatch(r"v\d+\.\d+", str(version)):
+        print("Invalid WhatsApp Cloud API version in config.")
+        return 1
+    base = f"https://graph.facebook.com/{version}/{phone_id}"
+    pin = ""
+
+    def request(path, payload=None):
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(base + path, data=data, headers={
+            "Authorization": "Bearer " + token, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.load(response)
+
+    def status():
+        result = request("?fields=platform_type,code_verification_status,status")
+        print(json.dumps({key: result.get(key) for key in (
+            "id", "platform_type", "code_verification_status", "status")}))
+        return result
+
+    try:
+        current = status()
+        if not register or current.get("platform_type") == "CLOUD_API":
+            return 0
+        if current.get("code_verification_status") != "VERIFIED":
+            print("Complete Meta's SMS verification before registering this number.")
+            return 1
+        if not sys.stdin.isatty():
+            print("Registration requires an interactive terminal for hidden PIN entry.")
+            return 1
+        pin = getpass.getpass(f"Registration PIN for phone ID {phone_id} (hidden): ").strip()
+        if not re.fullmatch(r"[0-9]{6}", pin):
+            print("The PIN must contain exactly six digits. Nothing submitted.")
+            return 1
+        result = request("/register", {"messaging_product": "whatsapp", "pin": pin})
+        if result.get("success") not in (True, "true"):
+            print("Meta did not confirm registration. Check status before retrying.")
+            return 1
+        print("Meta accepted registration.")
+        return 0 if status().get("platform_type") == "CLOUD_API" else 1
+    except urllib.error.HTTPError as error:
+        try:
+            detail = json.load(error).get("error", {})
+            message = str(detail.get("message", "No error detail supplied"))
+            for secret in (token, pin):
+                if secret:
+                    message = message.replace(secret, "[redacted]")
+            print(json.dumps({"http_status": error.code, "code": detail.get("code"),
+                              "error_subcode": detail.get("error_subcode"), "message": message}))
+        except (ValueError, TypeError, AttributeError):
+            print(f"Meta returned HTTP {error.code} without a readable error.")
+        return 1
+    except (urllib.error.URLError, TimeoutError, ValueError, EOFError, KeyboardInterrupt):
+        print("Registration interrupted or response unavailable. Check status before retrying.")
+        return 1
+
 def _header(title: str) -> None:
     _lines("─" * 50, title, "─" * 50)
 

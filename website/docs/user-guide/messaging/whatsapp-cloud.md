@@ -38,6 +38,19 @@ The wizard walks you through every credential, validates each one as you paste i
 
 The rest of this page is the manual reference.
 
+After SMS verification, register the saved phone ID with Meta:
+
+```bash
+hermes whatsapp-cloud status
+hermes whatsapp-cloud register
+```
+
+Registration reads the existing credentials and asks for your six-digit PIN in
+an interactive, hidden prompt. It never saves the PIN or accepts it as a command
+argument. It reports Meta's error code when registration fails and verifies the
+number's Cloud API platform after success. An already registered number is left
+unchanged. This does not deregister an existing phone-app account.
+
 ---
 
 ## Prerequisites

@@ -1325,6 +1325,12 @@ class SlackAdapter(BasePlatformAdapter):
                 await asyncio.sleep(self._socket_watchdog_interval_s)
                 if not self._running:
                     break
+                rotation = getattr(self, "_app_token_rotation", None)
+                if rotation is not None:
+                    token = await rotation.token(self._app.client)
+                    if token != self._app_token:
+                        self._app_token = token
+                        await self._restart_socket_mode("app token renewed")
                 task = self._socket_mode_task
                 if task is None:
                     await self._restart_socket_mode("socket task missing")
@@ -1788,14 +1794,33 @@ class SlackAdapter(BasePlatformAdapter):
                 self._fatal_missing_env(env_name)
                 return False
         proxy_url = _resolve_slack_proxy_url()
+        self._app_token_rotation = None
+        if app_token.startswith("xoxe.xapp-"):
+            try:
+                from .token_rotation import AppTokenRotation
+            except ImportError:
+                from token_rotation import AppTokenRotation
+            rotation = AppTokenRotation()
+            if not rotation.state():
+                self._set_fatal_error("missing_slack_rotation", "Rotating app token needs refresh credentials; run hermes gateway setup", retryable=False)
+                logger.error("[Slack] Rotating app token needs refresh credentials; run hermes gateway setup")
+                return False
+            self._app_token_rotation = rotation
         if proxy_url:
             logger.info("[Slack] Using proxy for Slack transport: %s", safe_url_for_log(proxy_url))
         bot_tokens = _load_slack_bot_tokens(raw_token, quiet=False)
         lock_acquired = False
         try:
-            if not self._acquire_platform_lock("slack-app-token", app_token, "Slack app token"):
+            lock_identity = (self._app_token_rotation.state()["client_id"]
+                             if self._app_token_rotation else app_token)
+            if not self._acquire_platform_lock("slack-app-token", lock_identity, "Slack app token"):
                 return False
             lock_acquired = True
+            if self._app_token_rotation is not None:
+                async with aiohttp.ClientSession() as session:
+                    client = self._new_web_client(None, proxy_url)
+                    client.session = session
+                    app_token = await self._app_token_rotation.token(client)
             self._running = False
             # Cancel AND await the old watchdog so it can't see _running=False,
             # exit, and leave no monitor behind.
@@ -6792,13 +6817,23 @@ def interactive_setup() -> None:
     # Write the manifest up-front for the "Create from manifest" flow.
     _write_slack_manifest_and_instruct()
     print()
-    bot_token = prompt("Slack Bot Token (xoxb-...)", password=True)
+    print_info("Leave access-token prompts blank to keep the tokens already saved.")
+    bot_token = prompt("Slack Bot Token (xoxb-...)", password=True) or _get_scoped_secret("SLACK_BOT_TOKEN")
     if not bot_token:
         return
     save_env_value("SLACK_BOT_TOKEN", bot_token)
-    app_token = prompt("Slack App Token (xapp-...)", password=True)
+    app_token = prompt("Slack App Token (xapp-...)", password=True) or _get_scoped_secret("SLACK_APP_TOKEN")
     if app_token:
         save_env_value("SLACK_APP_TOKEN", app_token)
+        if app_token.startswith("xoxe.xapp-"):
+            try:
+                from .token_rotation import AppTokenRotation
+            except ImportError:
+                from token_rotation import AppTokenRotation
+            refresh_token = prompt("Slack App Refresh Token (xoxe-...)", password=True)
+            client_id = prompt("Slack Client ID (Basic Information)")
+            client_secret = prompt("Slack Client Secret (Basic Information)", password=True)
+            AppTokenRotation().configure(app_token, refresh_token, client_id, client_secret)
     print_success("Slack tokens saved")
     print()
     print_info("🔒 Security: Restrict who can use your bot")

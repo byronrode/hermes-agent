@@ -15,11 +15,13 @@ def test_registration_verifies_outcome_and_redacts_credentials(monkeypatch, tmp_
     token, pin = "EAA-test-private-token", "357159"
     save_env_value("WHATSAPP_CLOUD_PHONE_NUMBER_ID", "1312743238595423")
     save_env_value("WHATSAPP_CLOUD_ACCESS_TOKEN", token)
+    save_env_value("WHATSAPP_CLOUD_API_VERSION", "v26.0")
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("getpass.getpass", lambda prompt: pin)
     calls = []
 
     def respond(request, timeout):
+        assert "/v26.0/" in request.full_url
         calls.append(request)
         if request.data:
             assert json.loads(request.data) == {"messaging_product": "whatsapp", "pin": pin}
@@ -28,7 +30,7 @@ def test_registration_verifies_outcome_and_redacts_credentials(monkeypatch, tmp_
                 body = {"error": {"code": 133005, "message": f"Rejected {token} PIN {pin}"}}
                 raise urllib.error.HTTPError(request.full_url, 400, "Bad request", {},
                                               io.BytesIO(json.dumps(body).encode()))
-            result = {"success": True}
+            result = {"success": "true"}
         else:
             result = {"platform_type": "CLOUD_API" if len(calls) > 1 else "NOT_APPLICABLE",
                       "code_verification_status": "VERIFIED"}

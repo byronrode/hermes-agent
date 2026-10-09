@@ -137,15 +137,17 @@ def run_whatsapp_cloud_registration(*, register: bool = False) -> int:
     import json
     import urllib.error
     import urllib.request
-    from hermes_cli.config import get_env_value, load_config
+    from hermes_cli.config import get_env_value
+    from gateway.config import Platform, load_gateway_config
+    from gateway.platforms.whatsapp_cloud import DEFAULT_API_VERSION
 
     phone_id = get_env_value("WHATSAPP_CLOUD_PHONE_NUMBER_ID") or ""
     token = get_env_value("WHATSAPP_CLOUD_ACCESS_TOKEN") or ""
     if not _validate_phone_number_id(phone_id)[0] or not token:
         print("Run hermes whatsapp-cloud setup to save a phone ID and access token first.")
         return 1
-    config = load_config()
-    version = config.get("platforms", {}).get("whatsapp_cloud", {}).get("extra", {}).get("api_version", "v25.0")
+    platform = load_gateway_config().platforms.get(Platform.WHATSAPP_CLOUD)
+    version = platform.extra.get("api_version", DEFAULT_API_VERSION) if platform else DEFAULT_API_VERSION
     if not re.fullmatch(r"v\d+\.\d+", str(version)):
         print("Invalid WhatsApp Cloud API version in config.")
         return 1
@@ -180,7 +182,7 @@ def run_whatsapp_cloud_registration(*, register: bool = False) -> int:
             print("The PIN must contain exactly six digits. Nothing submitted.")
             return 1
         result = request("/register", {"messaging_product": "whatsapp", "pin": pin})
-        if result.get("success") is not True:
+        if result.get("success") not in (True, "true"):
             print("Meta did not confirm registration. Check status before retrying.")
             return 1
         print("Meta accepted registration.")

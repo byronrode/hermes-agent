@@ -307,13 +307,26 @@ Meta only allows **free-form messages** within a 24-hour window after the user's
 **What this means in practice:**
 
 - Reactive chat (user DMs → bot replies within 24h → user replies → ...) works forever. This covers >95% of normal bot use.
-- **Cron jobs that deliver to WhatsApp** after a gap > 24h will fail with Graph error code `131047` ("Re-engagement message").
+- **Cron jobs that deliver to WhatsApp** after a gap > 24h without a configured approved template will fail with Graph error code `131047` ("Re-engagement message").
 - **Long-running `delegate_task` async results** that take longer than 24h fail the same way.
 - **Webhook subscribers** that route external events to WhatsApp fail when the user hasn't DM'd the bot recently.
 
 Hermes warns the agent about this window in its system prompt, so the model knows to mention it when scheduling delayed messages.
 
-Message-template support (the workaround for outside-window sends) is not yet implemented in Hermes. If you need it, please [open an issue](https://github.com/NousResearch/hermes-agent/issues) — it's planned but waiting on a clear demand signal.
+Scheduled text updates can use an approved template with one positional body variable (`{{1}}`). Configure the template in the sending profile:
+
+```yaml
+platforms:
+  whatsapp_cloud:
+    extra:
+      scheduled_template:
+        name: mara_requested_reminder
+        language: en
+```
+
+Only cron deliveries carrying a job ID use this template; ordinary conversation replies remain free-form. Meta must approve the template for this WhatsApp account before enabling it. The scheduled update is flattened to a single line and passed as the single body variable, so use a concise summary with a link for updates longer than 1024 characters. Failed template sends remain delivery failures; Hermes does not retry them as ordinary messages or silently cut off the content. These template deliveries may be billable even during an open conversation.
+
+Asynchronous engineering results and arbitrary webhook notifications still require an open conversation unless delivered through a configured scheduled job.
 
 ### Group chats
 
@@ -355,7 +368,7 @@ Your access token is invalid.  Subcodes:
 The 24-hour conversation window expired (see "Known limitations").  Either:
 
 - Ask the user to DM the bot first to reopen the window.
-- Wait for template support to land in Hermes.
+- For scheduled updates, configure an approved scheduled template as described above.
 
 ### Inbound message: `media metadata fetch failed (status=401)`
 

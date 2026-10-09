@@ -354,6 +354,9 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+        scheduled_template = (self.config.extra or {}).get("scheduled_template")
+        if (metadata or {}).get("job_id") and scheduled_template:
+            return await self.send_template(chat_id, content, scheduled_template)
         formatted = self.format_message(content)
         last_message_id: Optional[str] = None
         for idx, chunk in enumerate(self.truncate_message(formatted, self._outgoing_chunk_limit())):
@@ -374,6 +377,35 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if last_message_id:
             await rich_sent_store.record_async(chat_id, last_message_id, formatted)
         return SendResult(success=True, message_id=last_message_id)
+
+    async def send_template(self, chat_id: str, content: str, template: Dict[str, Any]) -> SendResult:
+        """Deliver an approved scheduled template with one body variable.
+
+        Explicit configuration leaves ordinary replies free-form and avoids
+        retrying an uncertain send as a second, potentially billable message.
+        """
+        if not isinstance(template, dict) or not template.get("name") or not template.get("language"):
+            return SendResult(success=False, error="scheduled_template requires name and language")
+        # Meta rejects newlines, tabs and repeated spaces in template variables.
+        content = " ".join(content.split())
+        if len(content) > 1024:
+            return SendResult(success=False, error="Template update exceeds 1024 characters; use a concise summary with a link")
+        payload = self._outbound_payload(chat_id, "template", {
+            "name": template["name"],
+            "language": {"code": template["language"]},
+            "components": [{"type": "body", "parameters": [{"type": "text", "text": content}]}],
+        }, None)
+        ids, err = await self._post_messages(
+            payload,
+            fail_log="[whatsapp_cloud] scheduled template send failed",
+            reject_log="[whatsapp_cloud] scheduled template rejected (status=%d): %s",
+        )
+        if err is not None:
+            return SendResult(success=False, error=err)
+        message_id = ids[0].get("id") if ids else None
+        if message_id:
+            await rich_sent_store.record_async(chat_id, message_id, content)
+        return SendResult(success=True, message_id=message_id)
 
     # ------------------------------------------------------------------ typing indicator + read receipts
     async def send_typing(self, chat_id: str, metadata=None) -> None:

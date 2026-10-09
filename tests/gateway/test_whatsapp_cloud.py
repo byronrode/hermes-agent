@@ -1465,3 +1465,44 @@ class TestReplyContextResolution:
         assert event.media_urls == [str(image)]
         assert event.media_types == ["image/png"]
 
+
+class TestScheduledTemplates:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scheduled", [True, False])
+    async def test_scheduled_template_does_not_change_chat_replies(self, scheduled):
+        from cron.scheduler_delivery import _is_known_delivery_platform
+        assert _is_known_delivery_platform("whatsapp_cloud")
+        adapter = _make_adapter()
+        adapter.config.extra = {"scheduled_template": {"name": "requested_reminder", "language": "en"}}
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(return_value=_mock_httpx_response(
+            200, {"messages": [{"id": "wamid.reminder"}]}))
+        text = "Review\nyour\tnotes     today"
+        result = await adapter.send("15551234567", text, metadata={"job_id": "reminder"} if scheduled else {})
+        assert result.success
+        payload = adapter._http_client.post.call_args.kwargs["json"]
+        assert payload["to"] == "15551234567"
+        assert payload["type"] == ("template" if scheduled else "text")
+        if scheduled:
+            assert payload["template"] == {
+                "name": "requested_reminder", "language": {"code": "en"},
+                "components": [{"type": "body", "parameters": [{"type": "text", "text": "Review your notes today"}]}],
+            }
+        else:
+            assert payload["text"]["body"] == adapter.format_message(text)
+        assert adapter._http_client.post.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", ["too_long", "invalid_config", "meta_rejected"])
+    async def test_template_failure_is_not_retried_as_freeform(self, case):
+        adapter = _make_adapter()
+        adapter.config.extra = {"scheduled_template": {"name": "requested_reminder", "language": "en"}}
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(return_value=_mock_httpx_response(
+            400, {"error": {"code": 132001, "message": "Template does not exist"}}))
+        if case == "invalid_config":
+            adapter.config.extra["scheduled_template"] = {"name": "requested_reminder"}
+        text = "x" * 1025 if case == "too_long" else "Review your notes"
+        result = await adapter.send("15551234567", text, metadata={"job_id": "reminder"})
+        assert not result.success
+        assert adapter._http_client.post.call_count == (1 if case == "meta_rejected" else 0)

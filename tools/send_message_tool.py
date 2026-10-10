@@ -692,6 +692,12 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     media_files = media_files or []
+    if platform == Platform.WHATSAPP_CLOUD and _live_adapter(platform)[1] is None:
+        if media_files:
+            return {"error": "Standalone WhatsApp Cloud delivery currently supports text only"}
+        from gateway.platforms.whatsapp_cloud import send_whatsapp_cloud_standalone
+        return await send_whatsapp_cloud_standalone(
+            pconfig, chat_id, message, metadata=(args or {}).get("metadata"))
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
     # Telegram chunks internally on the *formatted* text (escaping inflates length).

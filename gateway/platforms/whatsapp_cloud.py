@@ -155,6 +155,21 @@ def _optional_module(name: str, unavailable_log: str) -> Any:
 _INBOUND_MEDIA_CACHE = Path(get_hermes_dir("platforms/whatsapp_cloud/media", "whatsapp_cloud/media"))
 
 
+async def send_whatsapp_cloud_standalone(config, chat_id, content, *, metadata=None):
+    """Use the normal outbound adapter without starting a second webhook listener."""
+    adapter = WhatsAppCloudAdapter(config)
+    if not adapter._phone_number_id or not adapter._access_token:
+        return {"error": "WhatsApp Cloud phone number ID and access token are required"}
+    import httpx
+    from gateway.platforms._http_client_limits import platform_httpx_limits
+    async with httpx.AsyncClient(timeout=30, limits=platform_httpx_limits()) as client:
+        adapter._http_client = client
+        result = await adapter.send(chat_id, content, metadata=metadata)
+    if not result.success:
+        return {"error": result.error}
+    return {"success": True, "message_id": result.message_id}
+
+
 def check_whatsapp_cloud_requirements() -> bool:
     """aiohttp (webhook server) + httpx (Graph API) — both default deps."""
     return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE

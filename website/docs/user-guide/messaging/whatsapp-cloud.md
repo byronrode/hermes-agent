@@ -339,6 +339,13 @@ platforms:
 
 Only cron deliveries carrying a job ID use this template; ordinary conversation replies remain free-form. Meta must approve the template for this WhatsApp account before enabling it. The scheduled update is flattened to a single line and passed as the single body variable, so use a concise summary with a link for updates longer than 1024 characters. Failed template sends remain delivery failures; Hermes does not retry them as ordinary messages or silently cut off the content. These template deliveries may be billable even during an open conversation.
 
+`hermes send --to whatsapp_cloud --file result.txt` also supports text delivery
+from a separate process, using the sending profile's configured credentials and
+the same Cloud adapter. It does not start another webhook listener. Manual sends
+are free-form and require an open conversation; standalone cron delivery retains
+the job ID and uses the configured scheduled template. A successful API send is
+acceptance by Meta, not proof that the recipient has received or read it.
+
 Asynchronous engineering results and arbitrary webhook notifications still require an open conversation unless delivered through a configured scheduled job.
 
 ### Group chats

@@ -1025,11 +1025,12 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return None
         media_urls, media_types, media_text_inlined = [], [], []
         if msg_type_str in _INBOUND_MEDIA_KINDS:
+            has_user_text = bool(body)
             media_urls, media_types, body = await self._collect_inbound_media(msg_type_str, raw_message, body)
-            if not media_urls and not body:
+            if not media_urls and not has_user_text:
                 await self._reply_best_effort(
                     chat_id,
-                    "I received your attachment, but couldn't download it from WhatsApp after retrying. "
+                    "I received your attachment, but couldn't download it from WhatsApp. "
                     "I haven't processed its contents. Please resend it.",
                     "[whatsapp_cloud] media download failure notice could not be sent",
                 )

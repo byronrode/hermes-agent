@@ -815,7 +815,8 @@ class TestDownloadMedia:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("failure", ["transport", "unauthorized"])
-    async def test_failed_voice_download_reports_failure_without_empty_turn(self, monkeypatch, failure):
+    @pytest.mark.parametrize("kind", ["audio", "document"])
+    async def test_failed_attachment_reports_failure_without_empty_turn(self, monkeypatch, failure, kind):
         import ssl
         from gateway.platforms import whatsapp_cloud as wac
 
@@ -828,7 +829,8 @@ class TestDownloadMedia:
         else:
             adapter._http_client.get.return_value = MagicMock(status_code=401)
         event = await adapter._build_message_event_from_cloud(
-            {"id": "voice-wamid", "from": "15551234567", "type": "audio", "audio": {"id": "voice", "mime_type": "audio/ogg"}},
+            {"id": "attachment-wamid", "from": "15551234567", "type": kind,
+             kind: {"id": "attachment", "mime_type": "audio/ogg" if kind == "audio" else "application/pdf", "filename": "brief.pdf"}},
             {}, {},
         )
 

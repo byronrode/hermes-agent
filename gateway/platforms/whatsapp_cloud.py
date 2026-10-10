@@ -20,6 +20,7 @@ import mimetypes
 import os
 import re
 import shutil
+import ssl
 import uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -651,11 +652,20 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     # ------------------------------------------------------------------ inbound media
     async def _graph_get(self, url: str, headers: Dict[str, str], what: str, media_id: str) -> Any:
         """GET with the download path's uniform failure logging; None on exception or non-200."""
-        try:
-            resp = await self._http_client.get(url, headers=headers)
-        except Exception:
-            logger.exception("[whatsapp_cloud] media %s fetch raised (id=%s)", what, media_id)
-            return None
+        for attempt in range(3):
+            try:
+                resp = await self._http_client.get(url, headers=headers)
+                break
+            except (httpx.TransportError, ssl.SSLError):
+                # Meta's media host can fail an individual TLS connection. GET is
+                # safe to retry; never turn that failure into an empty agent turn.
+                if attempt == 2:
+                    logger.exception("[whatsapp_cloud] media %s fetch exhausted retries (id=%s)", what, media_id)
+                    return None
+                await asyncio.sleep(0.5 * (attempt + 1))
+            except Exception:
+                logger.exception("[whatsapp_cloud] media %s fetch raised (id=%s)", what, media_id)
+                return None
         if resp.status_code != 200:
             logger.warning("[whatsapp_cloud] media %s fetch failed (id=%s, status=%d)", what, media_id, resp.status_code)
             return None
@@ -1015,7 +1025,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return None
         media_urls, media_types, media_text_inlined = [], [], []
         if msg_type_str in _INBOUND_MEDIA_KINDS:
+            has_user_text = bool(body)
             media_urls, media_types, body = await self._collect_inbound_media(msg_type_str, raw_message, body)
+            if not media_urls and not has_user_text:
+                await self._reply_best_effort(
+                    chat_id,
+                    "I received your attachment, but couldn't download it from WhatsApp. "
+                    "I haven't processed its contents. Please resend it.",
+                    "[whatsapp_cloud] media download failure notice could not be sent",
+                )
+                return None
             if msg_type_str == "document" and media_urls:
                 body, media_text_inlined = self._inject_document_text(media_urls, body)
         # Meta's ``context`` gives only the quoted message's id (+ author), never its text or

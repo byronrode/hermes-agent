@@ -1,6 +1,7 @@
 """Authenticated Slack downloads retain the token only on validated CDN hops."""
 import asyncio
 import socket
+import ssl
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -27,6 +28,39 @@ START = "https://files.slack.com/files-pri/TSECOND-F123/image.png"
 ORIGIN = "https://files-origin.slack.com/files-pri/TSECOND-F123/image.png"
 IMAGE = b"\x89PNG\r\n\x1a\nimage bytes"
 TOKEN = "test-download-token"
+
+
+@pytest.mark.parametrize("error", [ssl.SSLError("record layer failure"), httpx.ConnectError("connection reset")])
+def test_transient_download_failure_recovers(adapter, install_transport, monkeypatch, error):
+    calls = []
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    def serve(request):
+        calls.append(request)
+        if len(calls) == 1:
+            raise error
+        return httpx.Response(200, content=IMAGE)
+
+    install_transport(serve)
+    assert asyncio.run(adapter._download_slack_file_bytes(START)) == IMAGE
+    assert len(calls) == 2
+
+
+def test_exhausted_audio_download_is_not_blank(adapter, install_transport, monkeypatch):
+    calls = []
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    def serve(request):
+        calls.append(request)
+        raise ssl.SSLError("record layer failure")
+
+    install_transport(serve)
+    event = {"files": [{"id": "F123", "name": "voice.m4a", "mimetype": "audio/mp4", "url_private_download": START}]}
+    urls, types, inlined, text = asyncio.run(adapter._collect_inbound_media(event, "D123", "TSECOND", "", [], []))
+    assert not urls and not types and not inlined
+    assert "attachment was received" in text
+    assert "contents are unavailable" in text
+    assert len(calls) == 3
 
 
 @pytest.fixture

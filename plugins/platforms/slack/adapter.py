@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -1447,6 +1448,9 @@ class SlackAdapter(BasePlatformAdapter):
             template = _SLACK_HTTP_STATUS_TEMPLATES.get(exc.response.status_code)
             if template:
                 return template.format(file_label=file_label)
+        if httpx is not None and isinstance(exc, (httpx.TransportError, ssl.SSLError)):
+            return (f"Slack could not download {file_label} after retrying. "
+                    "The attachment was received, but its contents are unavailable.")
         message = str(exc)
         if "Slack returned HTML instead of media" in message or "non-image data" in message:
             return (
@@ -6319,7 +6323,7 @@ class SlackAdapter(BasePlatformAdapter):
                             "check bot token scopes and file permissions, or a cross-origin "
                             "redirect dropped the token (Enterprise Grid files-origin)")
                     return response.content
-                except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                except (httpx.TransportError, httpx.HTTPStatusError, ssl.SSLError) as exc:
                     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
                         raise
                     if attempt < 2:

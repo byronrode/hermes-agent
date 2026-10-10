@@ -790,6 +790,53 @@ class TestDownloadMedia:
         local_path, mime = await adapter._download_media_to_cache("missing")
         assert local_path is None and mime is None
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stage", ["metadata", "bytes"])
+    async def test_transient_tls_failure_retries_and_preserves_media(self, tmp_path, monkeypatch, stage):
+        import ssl
+        from gateway.platforms import whatsapp_cloud as wac
+
+        monkeypatch.setattr(wac, "_INBOUND_MEDIA_CACHE", tmp_path)
+        monkeypatch.setattr(wac.asyncio, "sleep", AsyncMock())
+        adapter = _make_adapter()
+        metadata = MagicMock(status_code=200)
+        metadata.json.return_value = {"url": "https://lookaside.fbsbx.com/media", "mime_type": "audio/ogg"}
+        blob = MagicMock(status_code=200, content=b"voice-note")
+        failure = ssl.SSLError("TLSV1_ALERT_DECODE_ERROR")
+        responses = [failure, metadata, blob] if stage == "metadata" else [metadata, failure, blob]
+        adapter._http_client = MagicMock(get=AsyncMock(side_effect=responses))
+
+        path, mime = await adapter._download_media_to_cache("voice")
+
+        assert mime == "audio/ogg"
+        assert _os.path.exists(path)
+        assert _os.path.getsize(path) == len(blob.content)
+        assert adapter._http_client.get.await_count == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["transport", "unauthorized"])
+    async def test_failed_voice_download_reports_failure_without_empty_turn(self, monkeypatch, failure):
+        import ssl
+        from gateway.platforms import whatsapp_cloud as wac
+
+        monkeypatch.setattr(wac.asyncio, "sleep", AsyncMock())
+        adapter = _make_adapter()
+        adapter.send = AsyncMock()
+        adapter._http_client = MagicMock(get=AsyncMock())
+        if failure == "transport":
+            adapter._http_client.get.side_effect = ssl.SSLError("TLSV1_ALERT_DECODE_ERROR")
+        else:
+            adapter._http_client.get.return_value = MagicMock(status_code=401)
+        event = await adapter._build_message_event_from_cloud(
+            {"id": "voice-wamid", "from": "15551234567", "type": "audio", "audio": {"id": "voice", "mime_type": "audio/ogg"}},
+            {}, {},
+        )
+
+        assert event is None
+        adapter.send.assert_awaited_once()
+        assert "haven't processed" in adapter.send.call_args.args[1]
+        assert adapter._http_client.get.await_count == (3 if failure == "transport" else 1)
+
 
 class TestInboundMediaDispatch:
     """End-to-end: webhook with image_id -> adapter downloads -> MessageEvent.media_urls populated."""

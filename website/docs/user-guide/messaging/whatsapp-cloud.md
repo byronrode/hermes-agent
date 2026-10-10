@@ -10,7 +10,7 @@ Python dependency commands on this page use a
 [PM-prepared source checkout](../../reference/package-management.md#developer-workflow).
 After a dependency change, reactivate the checkout and restart Hermes.
 
-Hermes can connect to WhatsApp through Meta's **official** WhatsApp Business Cloud API. This is the production-grade path: no Node.js bridge subprocess, no QR codes, no account-ban risk.
+Hermes can connect to WhatsApp through Meta's **official** WhatsApp Business Cloud API. This path avoids the unofficial Node.js bridge and QR pairing; Meta's account policies and restrictions still apply.
 
 In exchange:
 
@@ -394,6 +394,12 @@ Common cause: the toolset configured for `whatsapp_cloud` is missing the tools t
 If the model emits tool-call-shaped text instead of a structured call, it usually means the toolset was effectively empty.  See `hermes_cli/platforms.py` for the platform → default toolset mapping.
 
 ### STT (voice note transcription) returns empty / "could not transcribe"
+
+Check whether the audio was downloaded before changing the STT provider. The Cloud
+adapter retries transient media transport failures up to three attempts. If the
+attachment still cannot be downloaded, it sends an explicit failure notice rather
+than starting an agent turn with missing audio. TLS certificate verification stays
+enabled, and authorization failures are not retried.
 
 The default `stt.provider: local` requires `python -c "import pm; pm.sync_venv(['stt-whisper'], explicit=True)"`.  If you're a Nous subscriber, you can route STT through the managed gateway instead — select **Nous Subscription** for speech-to-text in `hermes tools`, or set it directly:
 

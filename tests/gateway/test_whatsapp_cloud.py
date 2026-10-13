@@ -1647,6 +1647,7 @@ class TestScheduledTemplates:
                 windows.record_inbound(owner._window_home, "phone", "chat", now + 100)
             with profile_scope(homes[1]):
                 other = WhatsAppCloudAdapter(config)
+                windows.record_inbound(other._window_home, "phone", "chat", now - 86401)
                 assert not windows.is_open(other._window_home, "phone", "chat")
                 assert not windows.is_open(owner._window_home, "other-phone", "chat")
                 owner._http_client = MagicMock()
@@ -1654,6 +1655,7 @@ class TestScheduledTemplates:
                     200, {"messages": [{"id": "wamid.reminder"}]}))
                 await owner.send("chat", "A conversational nudge.", metadata={"job_id": "reminder"})
                 assert owner._http_client.post.call_args.kwargs["json"]["type"] == "text"
+                assert windows.is_open(other._window_home, "phone", "chat") is False
             with profile_scope(homes[0]):
                 assert windows.is_open(owner._window_home, "phone", "chat")
                 monkeypatch.setattr(windows.time, "time", lambda: now + 86400)

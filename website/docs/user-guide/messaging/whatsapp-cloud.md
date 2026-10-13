@@ -338,13 +338,16 @@ platforms:
 ```
 
 Cron deliveries carrying a job ID use ordinary chat messages while the customer's
-24-hour window is open, and this template when the window is closed or unknown.
+24-hour window is open, and this template when the window is closed.
 The sending profile stores the newest authenticated inbound Meta timestamp per
 receiving phone number and chat in `state/whatsapp_cloud_windows.db`. This survives
 gateway restarts and is shared with standalone cron sends. Outbound messages,
 delivery receipts, reactions and delayed older webhooks do not extend the window.
-Missing or unreadable state uses the template; agent-history timestamps are not
-used to guess a window. Ordinary conversation replies remain free-form.
+When state is missing or unreadable, the first free-form send lets Meta check the
+window. Only an explicit `131047` rejection switches it to a template. This also
+handles an existing open chat immediately after an upgrade without inventing its
+last inbound timestamp. Agent-history timestamps are not used to guess a window.
+Ordinary conversation replies remain free-form.
 
 Meta must approve the template for this WhatsApp account before enabling it. The
 template update is flattened to a single line and passed as the single body

@@ -374,7 +374,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         scheduled_template = (self.config.extra or {}).get("scheduled_template")
         if ((metadata or {}).get("job_id") and scheduled_template
-                and not await asyncio.to_thread(whatsapp_chat_window.is_open, self._window_home, self._phone_number_id, chat_id)):
+                and await asyncio.to_thread(whatsapp_chat_window.is_open, self._window_home, self._phone_number_id, chat_id) is False):
             return await self.send_template(chat_id, content, scheduled_template, metadata=metadata)
         formatted = self.format_message(content)
         last_message_id: Optional[str] = None

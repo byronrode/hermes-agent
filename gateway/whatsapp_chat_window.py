@@ -44,18 +44,20 @@ def record_inbound(home: Path, phone_id: str, chat_id: str, timestamp: object) -
         logger.warning("Could not persist WhatsApp customer-service window", exc_info=True)
 
 
-def is_open(home: Path, phone_id: str, chat_id: str) -> bool:
-    """Unknown, expired and unreadable windows require a template."""
+def is_open(home: Path, phone_id: str, chat_id: str) -> bool | None:
+    """None means unknown; Meta can authoritatively reject a first free-form send."""
     try:
         path = _path(home)
         if not path.exists():
-            return False
+            return None
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
             row = db.execute(
                 "SELECT last_inbound_at FROM chat_windows WHERE phone_id = ? AND chat_id = ?",
                 (phone_id, chat_id),
             ).fetchone()
-        return row is not None and 0 <= time.time() - row[0] < CUSTOMER_SERVICE_WINDOW_SECONDS
+        if row is None:
+            return None
+        return 0 <= time.time() - row[0] < CUSTOMER_SERVICE_WINDOW_SECONDS
     except (OSError, sqlite3.Error):
-        logger.warning("Could not read WhatsApp customer-service window; using template", exc_info=True)
-        return False
+        logger.warning("Could not read WhatsApp customer-service window; deferring to Meta", exc_info=True)
+        return None

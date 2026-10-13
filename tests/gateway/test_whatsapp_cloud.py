@@ -86,6 +86,9 @@ def _make_adapter(**overrides):
 
     # Phase 10 state — per-chat latest inbound wamid (for typing/read).
     adapter._last_inbound_wamid_by_chat = {}
+    from pathlib import Path
+    from hermes_constants import get_hermes_home
+    adapter._window_home = Path(get_hermes_home())
 
     # Phase 9 state — interactive-button correlation dicts.
     adapter._clarify_state = {}
@@ -123,6 +126,15 @@ def _mock_httpx_response(status_code: int, json_body: dict):
     resp.json = MagicMock(return_value=json_body)
     resp.text = json.dumps(json_body)
     return resp
+
+
+def _make_closed_window_adapter():
+    import time
+    from gateway import whatsapp_chat_window
+    adapter = _make_adapter()
+    whatsapp_chat_window.record_inbound(adapter._window_home, adapter._phone_number_id,
+                                       "15551234567", int(time.time()) - 86401)
+    return adapter
 
 
 # ---------------------------------------------------------------------------
@@ -1517,9 +1529,134 @@ class TestReplyContextResolution:
 
 class TestScheduledTemplates:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("case,age,kind,open_window", [
+        ("recent", 1, "text", True),
+        ("expired", 86401, "text", False),
+        ("boundary", 86400, "text", False),
+        ("future", -100, "text", False),
+        ("malformed", None, "text", False),
+        ("unsigned", 1, "text", False),
+        ("unauthorized", 1, "text", False),
+        ("other_number", 1, "text", False),
+        ("reaction", 1, "reaction", False),
+        ("status", 1, "text", False),
+        ("button", 1, "interactive", True),
+        ("attachment_failed", 1, "audio", True),
+        ("corrupt", 1, "text", False),
+        ("expired_by_meta", 1, "text", False),
+        ("uncertain_send", 1, "text", True),
+        ("other_rejection", 1, "text", True),
+        ("unknown_but_open", None, "text", True),
+    ])
+    async def test_authenticated_inbound_controls_scheduled_send(self, tmp_path, monkeypatch, case, age, kind, open_window):
+        import copy
+        import hashlib
+        import hmac
+        from gateway import whatsapp_chat_window as windows
+
+        now = 1700000000
+        monkeypatch.setattr(windows.time, "time", lambda: now)
+        adapter = _make_adapter(app_secret="test-signing-key")
+        adapter._window_home = tmp_path
+        adapter.handle_message = AsyncMock()
+        adapter._dispatch_interactive_reply = AsyncMock(return_value=True)
+        adapter._collect_inbound_media = AsyncMock(return_value=([], [], ""))
+        adapter._reply_best_effort = AsyncMock()
+        payload = copy.deepcopy(_SAMPLE_INBOUND_TEXT_PAYLOAD)
+        value = payload["entry"][0]["changes"][0]["value"]
+        value["metadata"]["phone_number_id"] = adapter._phone_number_id if case != "other_number" else "another-phone"
+        raw = value["messages"][0]
+        raw.update(type=kind, timestamp=str(now - age) if age is not None else "invalid")
+        raw.pop("text", None)
+        raw[kind] = {"body": "Hello"} if kind == "text" else {}
+        chat_id = raw["from"]
+        if case == "unauthorized":
+            adapter._dm_policy = "allowlist"
+            adapter._allow_from = {"a-different-user"}
+        if case == "status":
+            value["messages"] = []
+            value["statuses"] = [{"status": "delivered", "id": "outbound", "timestamp": str(now)}]
+        body = json.dumps(payload).encode()
+        signature = hmac.new(adapter._app_secret.encode(), body, hashlib.sha256).hexdigest()
+        response = await adapter._handle_webhook(_post_request(body, {
+            "X-Hub-Signature-256": "sha256=" + ("bad-signature" if case == "unsigned" else signature),
+        }))
+        assert response.status == (401 if case == "unsigned" else 200)
+        if case == "corrupt":
+            windows._path(tmp_path).write_text("broken database")
+        observed_window = windows.is_open(tmp_path, adapter._phone_number_id, chat_id)
+        if case in {"recent", "button", "attachment_failed", "expired_by_meta", "uncertain_send", "other_rejection"}:
+            assert observed_window is True
+        elif case in {"expired", "boundary"}:
+            assert observed_window is False
+        else:
+            assert observed_window is None
+
+        # A fresh instance is the same path standalone sends and a restarted gateway use.
+        sender = _make_adapter()
+        sender._window_home = tmp_path
+        sender.config.extra = {"scheduled_template": {"name": "requested_reminder", "language": "en"}}
+        sender._http_client = MagicMock()
+        sender._http_client.post = AsyncMock(return_value=_mock_httpx_response(
+            200, {"messages": [{"id": "wamid.reminder"}]}))
+        if case == "expired_by_meta" or (observed_window is None and case != "unknown_but_open"):
+            sender._http_client.post.side_effect = [
+                _mock_httpx_response(400, {"error": {"code": 131047, "message": "Window closed"}}),
+                _mock_httpx_response(200, {"messages": [{"id": "wamid.reminder"}]}),
+            ]
+        if case == "uncertain_send":
+            sender._http_client.post.side_effect = TimeoutError("Uncertain delivery")
+        if case == "other_rejection":
+            sender._http_client.post.return_value = _mock_httpx_response(401, {"error": {"code": 190}})
+        result = await sender.send(chat_id, "Have a look when you get a gap.", metadata={"job_id": "reminder"})
+        assert result.success is (case not in {"uncertain_send", "other_rejection"})
+        assert sender._http_client.post.call_args.kwargs["json"]["type"] == ("text" if open_window else "template")
+        assert sender._http_client.post.call_count == (
+            2 if case == "expired_by_meta" or (observed_window is None and case != "unknown_but_open") else 1)
+
+    @pytest.mark.asyncio
+    async def test_window_persistence_preserves_profile_bot_and_timestamp_ownership(self, tmp_path, monkeypatch):
+        from agent.secret_scope import set_multiplex_active
+        from gateway.run import _profile_runtime_scope
+        from gateway.config import PlatformConfig
+        from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
+        from gateway import whatsapp_chat_window as windows
+
+        now = 1700000000
+        monkeypatch.setattr(windows.time, "time", lambda: now)
+        homes = [tmp_path / "a", tmp_path / "b"]
+        for home in homes:
+            home.mkdir()
+        config = PlatformConfig(extra={"phone_number_id": "phone", "scheduled_template": {
+            "name": "reminder", "language": "en",
+        }})
+        set_multiplex_active(True)
+        try:
+            with _profile_runtime_scope(homes[0], prepared_secret_scope={}):
+                owner = WhatsAppCloudAdapter(config)
+                windows.record_inbound(owner._window_home, "phone", "chat", now - 1)
+                windows.record_inbound(owner._window_home, "phone", "chat", now - 86401)
+                windows.record_inbound(owner._window_home, "phone", "chat", now + 100)
+            with _profile_runtime_scope(homes[1], prepared_secret_scope={}):
+                other = WhatsAppCloudAdapter(config)
+                assert not windows.is_open(other._window_home, "phone", "chat")
+                assert not windows.is_open(owner._window_home, "other-phone", "chat")
+                owner._http_client = MagicMock()
+                owner._http_client.post = AsyncMock(return_value=_mock_httpx_response(
+                    200, {"messages": [{"id": "wamid.reminder"}]}))
+                await owner.send("chat", "A conversational nudge.", metadata={"job_id": "reminder"})
+                assert owner._http_client.post.call_args.kwargs["json"]["type"] == "text"
+            with _profile_runtime_scope(homes[0], prepared_secret_scope={}):
+                assert windows.is_open(owner._window_home, "phone", "chat")
+                monkeypatch.setattr(windows.time, "time", lambda: now + 86400)
+                assert not windows.is_open(owner._window_home, "phone", "chat")
+        finally:
+            set_multiplex_active(False)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("title", ["Project\nnotes", "x" * 75, "", None])
     async def test_title_header_uses_reminder_metadata(self, title):
-        adapter = _make_adapter()
+        adapter = _make_closed_window_adapter()
         adapter.config.extra = {"scheduled_template": {
             "name": "conversational_reminder", "language": "en", "header_source": "job_name",
         }}
@@ -1543,7 +1680,7 @@ class TestScheduledTemplates:
     async def test_scheduled_template_does_not_change_chat_replies(self, scheduled):
         from cron.scheduler_delivery import _is_known_delivery_platform
         assert _is_known_delivery_platform("whatsapp_cloud")
-        adapter = _make_adapter()
+        adapter = _make_closed_window_adapter()
         adapter.config.extra = {"scheduled_template": {"name": "requested_reminder", "language": "en"}}
         adapter._http_client = MagicMock()
         adapter._http_client.post = AsyncMock(return_value=_mock_httpx_response(
@@ -1566,7 +1703,7 @@ class TestScheduledTemplates:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("case", ["too_long", "invalid_config", "meta_rejected"])
     async def test_template_failure_is_not_retried_as_freeform(self, case):
-        adapter = _make_adapter()
+        adapter = _make_closed_window_adapter()
         adapter.config.extra = {"scheduled_template": {"name": "requested_reminder", "language": "en"}}
         adapter._http_client = MagicMock()
         adapter._http_client.post = AsyncMock(return_value=_mock_httpx_response(

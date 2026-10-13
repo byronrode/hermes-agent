@@ -47,8 +47,8 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin, _get_wsecret
 from gateway.platforms.access_policy_mixin import OPTIN_TRUTHY as _OPTIN_TRUTHY
 from gateway.platforms.media_cache import ext_for_mime
-from gateway import rich_sent_store
-from hermes_constants import get_hermes_dir
+from gateway import rich_sent_store, whatsapp_chat_window
+from hermes_constants import get_hermes_dir, get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +224,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Latest inbound wamid per chat: Meta's typing/read-receipt API needs a
         # message_id to attach to, and the base send_typing contract has none.
         self._last_inbound_wamid_by_chat: "OrderedDict[str, str]" = OrderedDict()
+        # Routed turns still use the receiving bot's profile for its service window.
+        self._window_home = Path(get_hermes_home())
         # Interactive-button state: short id (in the button payload) → session_key for
         # the gateway resolver. Popped on tap; FIFO-capped via bounded_put so ignored
         # prompts don't accumulate (an evicted tap degrades to text fallback).
@@ -371,7 +373,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
         scheduled_template = (self.config.extra or {}).get("scheduled_template")
-        if (metadata or {}).get("job_id") and scheduled_template:
+        if ((metadata or {}).get("job_id") and scheduled_template
+                and await asyncio.to_thread(whatsapp_chat_window.is_open, self._window_home, self._phone_number_id, chat_id) is False):
             return await self.send_template(chat_id, content, scheduled_template, metadata=metadata)
         formatted = self.format_message(content)
         last_message_id: Optional[str] = None
@@ -386,6 +389,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 reject_log="[whatsapp_cloud] send rejected (status=%d): %s",
             )
             if err is not None:
+                # Meta can close the window between our check and the first POST.
+                # 131047 is an explicit rejection; transport failures are uncertain and must not retry.
+                if (idx == 0 and (metadata or {}).get("job_id") and scheduled_template
+                        and err.startswith("graph error 131047 ")):
+                    return await self.send_template(chat_id, content, scheduled_template, metadata=metadata)
                 return SendResult(success=False, error=err)
             last_message_id = ids[0].get("id") if ids else last_message_id
         # Index (chat_id, wamid) → text: Meta's inbound ``context`` carries only the
@@ -1028,6 +1036,13 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if msg_type_str in _CONTENTLESS_KINDS:
             logger.debug("[whatsapp_cloud] skipping contentless %s envelope (wamid=%s)", msg_type_str, raw_message.get("id"))
             return None
+        sender_id = str(raw_message.get("from") or "").strip()
+        if (msg_type_str in _MESSAGE_TYPE_BY_KIND and not raw_message.get("chat")
+                and str(metadata.get("phone_number_id") or "") == self._phone_number_id
+                and sender_id and self._is_dm_allowed(sender_id)):
+            # Record before button resolution or attachment download: either is a real user message.
+            await asyncio.to_thread(whatsapp_chat_window.record_inbound,
+                                    self._window_home, self._phone_number_id, sender_id, raw_message.get("timestamp"))
         # Button taps route to the gateway resolver BEFORE text dispatch — the
         # resolver unblocks the waiting agent, so don't also start a fresh turn.
         if msg_type_str == "interactive" and await self._dispatch_interactive_reply(raw_message, contacts_by_waid):

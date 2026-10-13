@@ -1616,11 +1616,19 @@ class TestScheduledTemplates:
 
     @pytest.mark.asyncio
     async def test_window_persistence_preserves_profile_bot_and_timestamp_ownership(self, tmp_path, monkeypatch):
-        from agent.secret_scope import set_multiplex_active
-        from gateway.run import _profile_runtime_scope
+        from contextlib import ExitStack
+        from agent.secret_scope import set_multiplex_active, set_secret_scope, reset_secret_scope
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
         from gateway.config import PlatformConfig
         from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
         from gateway import whatsapp_chat_window as windows
+
+        def profile_scope(home):
+            # Exercise real profile bindings without importing the installation launcher.
+            scope = ExitStack()
+            scope.callback(reset_hermes_home_override, set_hermes_home_override(home))
+            scope.callback(reset_secret_scope, set_secret_scope({}, profile_home=str(home)))
+            return scope
 
         now = 1700000000
         monkeypatch.setattr(windows.time, "time", lambda: now)
@@ -1632,12 +1640,12 @@ class TestScheduledTemplates:
         }})
         set_multiplex_active(True)
         try:
-            with _profile_runtime_scope(homes[0], prepared_secret_scope={}):
+            with profile_scope(homes[0]):
                 owner = WhatsAppCloudAdapter(config)
                 windows.record_inbound(owner._window_home, "phone", "chat", now - 1)
                 windows.record_inbound(owner._window_home, "phone", "chat", now - 86401)
                 windows.record_inbound(owner._window_home, "phone", "chat", now + 100)
-            with _profile_runtime_scope(homes[1], prepared_secret_scope={}):
+            with profile_scope(homes[1]):
                 other = WhatsAppCloudAdapter(config)
                 assert not windows.is_open(other._window_home, "phone", "chat")
                 assert not windows.is_open(owner._window_home, "other-phone", "chat")
@@ -1646,7 +1654,7 @@ class TestScheduledTemplates:
                     200, {"messages": [{"id": "wamid.reminder"}]}))
                 await owner.send("chat", "A conversational nudge.", metadata={"job_id": "reminder"})
                 assert owner._http_client.post.call_args.kwargs["json"]["type"] == "text"
-            with _profile_runtime_scope(homes[0], prepared_secret_scope={}):
+            with profile_scope(homes[0]):
                 assert windows.is_open(owner._window_home, "phone", "chat")
                 monkeypatch.setattr(windows.time, "time", lambda: now + 86400)
                 assert not windows.is_open(owner._window_home, "phone", "chat")

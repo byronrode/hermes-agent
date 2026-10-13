@@ -82,6 +82,47 @@ class TestConfirmAdapterDelivery:
         assert "92e639af907f" in caplog.text
 
 
+@pytest.mark.parametrize("live", [True, False])
+def test_whatsapp_title_reaches_live_and_standalone_delivery(live):
+    job = _job()
+    job["origin"]["platform"] = "whatsapp_cloud"
+    job["name"] = "Project notes"
+    config = _gateway_config()
+    config.platforms = {Platform.WHATSAPP_CLOUD: PlatformConfig(enabled=True)}
+    adapter = MagicMock()
+    loop = MagicMock()
+    loop.is_running.return_value = True
+    sends = []
+
+    async def deliver(*args, **kwargs):
+        lane = "live" if len(args) == 3 else "standalone"
+        sends.append((lane, args[2] if lane == "live" else kwargs["args"]["metadata"]))
+        return {"success": True, "message_id": "wamid.reminder"}
+
+    router = MagicMock()
+    router._deliver_to_platform = deliver
+
+    def run_coro(coro, _loop):
+        future = Future()
+        future.set_result(asyncio.run(coro))
+        return future
+
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+         patch("cron.scheduler_delivery._record_delivery_verification"), \
+         patch("gateway.delivery.DeliveryRouter", return_value=router), \
+         patch("tools.send_message_tool._send_to_platform", deliver), \
+         patch("asyncio.run_coroutine_threadsafe", side_effect=run_coro):
+        error = _deliver_result(job, "Have a look when you get a gap.",
+                                adapters={Platform.WHATSAPP_CLOUD: adapter} if live else {}, loop=loop)
+    assert not error
+    assert len(sends) == 1
+    lane, metadata = sends[0]
+    assert lane == ("live" if live else "standalone")
+    assert metadata["job_name"] == job["name"]
+    assert metadata["job_id"] == job["id"]
+
+
 
 # ---------------------------------------------------------------------------
 # _deliver_result: the live lane end to end

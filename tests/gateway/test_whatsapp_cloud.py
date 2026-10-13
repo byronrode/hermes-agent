@@ -1517,6 +1517,28 @@ class TestReplyContextResolution:
 
 class TestScheduledTemplates:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("title", ["Project\nnotes", "x" * 75, "", None])
+    async def test_title_header_uses_reminder_metadata(self, title):
+        adapter = _make_adapter()
+        adapter.config.extra = {"scheduled_template": {
+            "name": "conversational_reminder", "language": "en", "header_source": "job_name",
+        }}
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(return_value=_mock_httpx_response(
+            200, {"messages": [{"id": "wamid.reminder"}]}))
+        text = "Have a look at your notes when you get a gap."
+        result = await adapter.send("15551234567", text, metadata={"job_id": "reminder", "job_name": title})
+        assert result.success is bool(title)
+        if not title:
+            adapter._http_client.post.assert_not_called()
+            return
+        components = adapter._http_client.post.call_args.kwargs["json"]["template"]["components"]
+        assert components == [
+            {"type": "header", "parameters": [{"type": "text", "text": " ".join(title.split())[:60]}]},
+            {"type": "body", "parameters": [{"type": "text", "text": text}]},
+        ]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("scheduled", [True, False])
     async def test_scheduled_template_does_not_change_chat_replies(self, scheduled):
         from cron.scheduler_delivery import _is_known_delivery_platform

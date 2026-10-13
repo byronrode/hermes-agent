@@ -399,7 +399,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 return SendResult(success=False, error=err)
             last_message_id = ids[0].get("id") if ids else last_message_id
             if (idx == 0 and last_message_id and (metadata or {}).get("job_id") and scheduled_template
-                    and len(content) <= 1024 and len(formatted) <= self._outgoing_chunk_limit()):
+                    and len(" ".join(content.split())) <= 1024 and len(formatted) <= self._outgoing_chunk_limit()):
                 await asyncio.to_thread(whatsapp_chat_window.remember_send, self._window_home,
                                         self._phone_number_id, chat_id, last_message_id, content,
                                         scheduled_template, (metadata or {}).get("job_name"))
@@ -1063,16 +1063,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         msg_type_str = str(raw_message.get("type") or "text").lower()
         # Contentless envelopes arrive on the same ``messages`` webhook field and carry no
         # user utterance; falling through would start a blank agent turn (#90157).
-        if msg_type_str in _CONTENTLESS_KINDS:
-            logger.debug("[whatsapp_cloud] skipping contentless %s envelope (wamid=%s)", msg_type_str, raw_message.get("id"))
-            return None
         sender_id = str(raw_message.get("from") or "").strip()
-        if (msg_type_str in _MESSAGE_TYPE_BY_KIND and not raw_message.get("chat")
+        if ((msg_type_str in _MESSAGE_TYPE_BY_KIND or msg_type_str == "reaction") and not raw_message.get("chat")
                 and str(metadata.get("phone_number_id") or "") == self._phone_number_id
                 and sender_id and self._is_dm_allowed(sender_id)):
             # Record before button resolution or attachment download: either is a real user message.
             await asyncio.to_thread(whatsapp_chat_window.record_inbound,
                                     self._window_home, self._phone_number_id, sender_id, raw_message.get("timestamp"))
+        if msg_type_str in _CONTENTLESS_KINDS:
+            logger.debug("[whatsapp_cloud] skipping contentless %s envelope (wamid=%s)", msg_type_str, raw_message.get("id"))
+            return None
         # Button taps route to the gateway resolver BEFORE text dispatch — the
         # resolver unblocks the waiting agent, so don't also start a fresh turn.
         if msg_type_str == "interactive" and await self._dispatch_interactive_reply(raw_message, contacts_by_waid):

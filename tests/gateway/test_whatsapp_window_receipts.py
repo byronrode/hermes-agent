@@ -13,7 +13,7 @@ from tests.gateway.test_whatsapp_cloud import _make_adapter, _mock_httpx_respons
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["after", "before", "duplicate", "wrong_chat", "wrong_phone",
-                                  "unsigned", "other_error", "expired", "delivered"])
+                                  "unsigned", "other_error", "expired", "delivered", "whitespace"])
 async def test_signed_window_failure_retries_only_its_undelivered_scheduled_message(tmp_path, monkeypatch, case):
     now = 1700000000
     monkeypatch.setattr(windows.time, "time", lambda: now)
@@ -48,7 +48,11 @@ async def test_signed_window_failure_retries_only_its_undelivered_scheduled_mess
         return _mock_httpx_response(200, {"messages": [{"id": "plain-id" if payload["type"] == "text" else "fallback-id"}]})
 
     adapter._http_client.post = AsyncMock(side_effect=post)
-    result = await adapter.send("chat", "Have a look at your notes.", metadata={"job_id": "job", "job_name": "Project notes"})
+    content = "Have a look at your notes."
+    if case == "whitespace":
+        content = "Have" + " \t\n" * 400 + "a look at your notes."
+        assert len(content) > 1024
+    result = await adapter.send("chat", content, metadata={"job_id": "job", "job_name": "Project notes"})
     assert result.success
     if case == "expired":
         monkeypatch.setattr(windows.time, "time", lambda: now + windows.FALLBACK_RECEIPT_SECONDS + 1)
@@ -56,11 +60,12 @@ async def test_signed_window_failure_retries_only_its_undelivered_scheduled_mess
         await receipt("delivered")
     await receipt()
     await receipt()
-    expected_retry = case in {"after", "before", "duplicate"}
+    expected_retry = case in {"after", "before", "duplicate", "whitespace"}
     assert [send["type"] for send in sends] == (["text", "template"] if expected_retry else ["text"])
     if expected_retry:
         assert sends[1]["to"] == "chat"
         assert sends[1]["template"]["components"][0]["parameters"][0]["text"] == "Project notes"
+        assert sends[1]["template"]["components"][1]["parameters"][0]["text"] == "Have a look at your notes."
 
 
 @pytest.mark.asyncio

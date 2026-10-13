@@ -342,7 +342,9 @@ Cron deliveries carrying a job ID use ordinary chat messages while the customer'
 The sending profile stores the newest authenticated inbound Meta timestamp per
 receiving phone number and chat in `state/whatsapp_cloud_windows.db`. This survives
 gateway restarts and is shared with standalone cron sends. Outbound messages,
-delivery receipts, reactions and delayed older webhooks do not extend the window.
+delivery receipts and delayed older webhooks do not extend the window. Authenticated
+user reactions are tracked without starting a blank agent turn; Meta's explicit
+window rejection remains authoritative if its rules differ from the local estimate.
 When state is missing or unreadable, the first free-form send lets Meta check the
 window. Only an explicit `131047` rejection switches it to a template. This also
 handles an existing open chat immediately after an upgrade without inventing its

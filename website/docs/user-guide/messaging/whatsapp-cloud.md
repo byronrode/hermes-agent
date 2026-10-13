@@ -349,7 +349,9 @@ used to guess a window. Ordinary conversation replies remain free-form.
 Meta must approve the template for this WhatsApp account before enabling it. The
 template update is flattened to a single line and passed as the single body
 variable, so use a concise summary with a link for updates longer than 1024
-characters. Failed or uncertain sends remain delivery failures and are not
+characters. If Meta explicitly rejects the first chat-message chunk with
+`131047` (window closed), Hermes sends the configured template instead. Other
+failures, uncertain sends and partially sent multi-chunk messages are not
 retried in another format, preventing duplicate messages.
 
 For a template whose text header is `{{1}}`, set `header_source: job_name`

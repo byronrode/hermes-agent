@@ -1534,6 +1534,9 @@ class TestScheduledTemplates:
         ("button", 1, "interactive", True),
         ("attachment_failed", 1, "audio", True),
         ("corrupt", 1, "text", False),
+        ("expired_by_meta", 1, "text", False),
+        ("uncertain_send", 1, "text", True),
+        ("other_rejection", 1, "text", True),
     ])
     async def test_authenticated_inbound_controls_scheduled_send(self, tmp_path, monkeypatch, case, age, kind, open_window):
         import copy
@@ -1579,10 +1582,19 @@ class TestScheduledTemplates:
         sender._http_client = MagicMock()
         sender._http_client.post = AsyncMock(return_value=_mock_httpx_response(
             200, {"messages": [{"id": "wamid.reminder"}]}))
+        if case == "expired_by_meta":
+            sender._http_client.post.side_effect = [
+                _mock_httpx_response(400, {"error": {"code": 131047, "message": "Window closed"}}),
+                _mock_httpx_response(200, {"messages": [{"id": "wamid.reminder"}]}),
+            ]
+        if case == "uncertain_send":
+            sender._http_client.post.side_effect = TimeoutError("Uncertain delivery")
+        if case == "other_rejection":
+            sender._http_client.post.return_value = _mock_httpx_response(401, {"error": {"code": 190}})
         result = await sender.send(chat_id, "Have a look when you get a gap.", metadata={"job_id": "reminder"})
-        assert result.success
+        assert result.success is (case not in {"uncertain_send", "other_rejection"})
         assert sender._http_client.post.call_args.kwargs["json"]["type"] == ("text" if open_window else "template")
-        assert sender._http_client.post.call_count == 1
+        assert sender._http_client.post.call_count == (2 if case == "expired_by_meta" else 1)
 
     @pytest.mark.asyncio
     async def test_window_persistence_preserves_profile_bot_and_timestamp_ownership(self, tmp_path, monkeypatch):

@@ -389,6 +389,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 reject_log="[whatsapp_cloud] send rejected (status=%d): %s",
             )
             if err is not None:
+                # Meta can close the window between our check and the first POST.
+                # 131047 is an explicit rejection; transport failures are uncertain and must not retry.
+                if (idx == 0 and (metadata or {}).get("job_id") and scheduled_template
+                        and err.startswith("graph error 131047 ")):
+                    return await self.send_template(chat_id, content, scheduled_template, metadata=metadata)
                 return SendResult(success=False, error=err)
             last_message_id = ids[0].get("id") if ids else last_message_id
         # Index (chat_id, wamid) → text: Meta's inbound ``context`` carries only the

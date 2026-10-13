@@ -1538,7 +1538,7 @@ class TestScheduledTemplates:
         ("unsigned", 1, "text", False),
         ("unauthorized", 1, "text", False),
         ("other_number", 1, "text", False),
-        ("reaction", 1, "reaction", False),
+        ("reaction", 1, "reaction", True),
         ("status", 1, "text", False),
         ("button", 1, "interactive", True),
         ("attachment_failed", 1, "audio", True),
@@ -1585,7 +1585,7 @@ class TestScheduledTemplates:
         if case == "corrupt":
             windows._path(tmp_path).write_text("broken database")
         observed_window = windows.is_open(tmp_path, adapter._phone_number_id, chat_id)
-        if case in {"recent", "button", "attachment_failed", "expired_by_meta", "uncertain_send", "other_rejection"}:
+        if case in {"recent", "reaction", "button", "attachment_failed", "expired_by_meta", "uncertain_send", "other_rejection"}:
             assert observed_window is True
         elif case in {"expired", "boundary"}:
             assert observed_window is False

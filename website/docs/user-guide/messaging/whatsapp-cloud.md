@@ -342,7 +342,9 @@ Cron deliveries carrying a job ID use ordinary chat messages while the customer'
 The sending profile stores the newest authenticated inbound Meta timestamp per
 receiving phone number and chat in `state/whatsapp_cloud_windows.db`. This survives
 gateway restarts and is shared with standalone cron sends. Outbound messages,
-delivery receipts, reactions and delayed older webhooks do not extend the window.
+delivery receipts and delayed older webhooks do not extend the window. Authenticated
+user reactions are tracked without starting a blank agent turn; Meta's explicit
+window rejection remains authoritative if its rules differ from the local estimate.
 When state is missing or unreadable, the first free-form send lets Meta check the
 window. Only an explicit `131047` rejection switches it to a template. This also
 handles an existing open chat immediately after an upgrade without inventing its
@@ -355,7 +357,16 @@ variable, so use a concise summary with a link for updates longer than 1024
 characters. If Meta explicitly rejects the first chat-message chunk with
 `131047` (window closed), Hermes sends the configured template instead. Other
 failures, uncertain sends and partially sent multi-chunk messages are not
-retried in another format, preventing duplicate messages.
+retried in another format by the adapter, preventing duplicate messages.
+
+Meta can also accept a send and report `131047` later in a signed status webhook.
+For single-message scheduled updates that fit the template limit, the same
+profile-owned SQLite database joins the accepted message ID with that rejection
+and claims one fallback attempt. Receipt-before-response races, duplicate
+webhooks and gateway restarts are handled; delivered messages are never retried.
+Candidates expire after ten minutes and are pruned on the next write, so stale
+reminders cannot be replayed days later. Unknown or failed fallback attempts are
+not repeated automatically.
 
 For a template whose text header is `{{1}}`, set `header_source: job_name`
 alongside `name` and `language`. Both live and standalone scheduled delivery

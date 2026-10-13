@@ -307,6 +307,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "with 503. Set the app secret to enable inbound message delivery."
             )
         self._wire_plugin_handlers(None)
+        for chat_id, message_id in await asyncio.to_thread(whatsapp_chat_window.retry_keys, self._window_home, self._phone_number_id):
+            await self._retry_window_rejection(chat_id, message_id)
         return True
 
     async def disconnect(self) -> None:
@@ -396,6 +398,12 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     return await self.send_template(chat_id, content, scheduled_template, metadata=metadata)
                 return SendResult(success=False, error=err)
             last_message_id = ids[0].get("id") if ids else last_message_id
+            if (idx == 0 and last_message_id and (metadata or {}).get("job_id") and scheduled_template
+                    and len(" ".join(content.split())) <= 1024 and len(formatted) <= self._outgoing_chunk_limit()):
+                await asyncio.to_thread(whatsapp_chat_window.remember_send, self._window_home,
+                                        self._phone_number_id, chat_id, last_message_id, content,
+                                        scheduled_template, (metadata or {}).get("job_name"))
+                await self._retry_window_rejection(chat_id, last_message_id)
         # Index (chat_id, wamid) → text: Meta's inbound ``context`` carries only the
         # quoted message's id, so this is how replies to our messages resolve text.
         if last_message_id:
@@ -439,6 +447,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if message_id:
             await rich_sent_store.record_async(chat_id, message_id, content)
         return SendResult(success=True, message_id=message_id)
+
+    async def _retry_window_rejection(self, chat_id: str, message_id: str) -> None:
+        retry = await asyncio.to_thread(whatsapp_chat_window.claim_retry, self._window_home,
+                                       self._phone_number_id, chat_id, message_id)
+        if retry is None:
+            return
+        content, template, job_name = retry
+        result = await self.send_template(chat_id, content, template, metadata={"job_name": job_name})
+        if not result.success:
+            logger.warning("[whatsapp_cloud] confirmed window-rejection fallback failed: %s", result.error)
 
     # ------------------------------------------------------------------ typing indicator + read receipts
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -834,6 +852,18 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         await self._ingest_message(raw_message, contacts_by_waid, value.get("metadata") or {})
                 for status in value.get("statuses") or []:
                     if isinstance(status, dict):
+                        window_rejected = status.get("status") == "failed" and any(
+                            error.get("code") == 131047 for error in status.get("errors") or [] if isinstance(error, dict))
+                        delivered = status.get("status") in {"delivered", "read"}
+                        if ((window_rejected or delivered)
+                                and str((value.get("metadata") or {}).get("phone_number_id") or "") == self._phone_number_id):
+                            chat_id, message_id = str(status.get("recipient_id") or ""), str(status.get("id") or "")
+                            if chat_id and message_id:
+                                await asyncio.to_thread(whatsapp_chat_window.remember_send, self._window_home,
+                                                        self._phone_number_id, chat_id, message_id,
+                                                        rejected=window_rejected, delivered=delivered)
+                                if window_rejected:
+                                    await self._retry_window_rejection(chat_id, message_id)
                         logger.debug("[whatsapp_cloud] status %s for %s", status.get("status"), status.get("id"))
 
     async def _ingest_message(self, raw_message: Dict[str, Any], contacts_by_waid: Dict[str, str], metadata: Dict[str, Any]) -> None:
@@ -1033,16 +1063,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         msg_type_str = str(raw_message.get("type") or "text").lower()
         # Contentless envelopes arrive on the same ``messages`` webhook field and carry no
         # user utterance; falling through would start a blank agent turn (#90157).
-        if msg_type_str in _CONTENTLESS_KINDS:
-            logger.debug("[whatsapp_cloud] skipping contentless %s envelope (wamid=%s)", msg_type_str, raw_message.get("id"))
-            return None
         sender_id = str(raw_message.get("from") or "").strip()
-        if (msg_type_str in _MESSAGE_TYPE_BY_KIND and not raw_message.get("chat")
+        if ((msg_type_str in _MESSAGE_TYPE_BY_KIND or msg_type_str == "reaction") and not raw_message.get("chat")
                 and str(metadata.get("phone_number_id") or "") == self._phone_number_id
                 and sender_id and self._is_dm_allowed(sender_id)):
             # Record before button resolution or attachment download: either is a real user message.
             await asyncio.to_thread(whatsapp_chat_window.record_inbound,
                                     self._window_home, self._phone_number_id, sender_id, raw_message.get("timestamp"))
+        if msg_type_str in _CONTENTLESS_KINDS:
+            logger.debug("[whatsapp_cloud] skipping contentless %s envelope (wamid=%s)", msg_type_str, raw_message.get("id"))
+            return None
         # Button taps route to the gateway resolver BEFORE text dispatch — the
         # resolver unblocks the waiting agent, so don't also start a fresh turn.
         if msg_type_str == "interactive" and await self._dispatch_interactive_reply(raw_message, contacts_by_waid):

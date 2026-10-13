@@ -11,8 +11,13 @@ from tools import send_message_tool as sends
 
 
 @pytest.mark.parametrize("scheduled", [False, True])
-def test_cloud_send_without_gateway_preserves_transport_and_template(monkeypatch, tmp_path, scheduled):
+@pytest.mark.parametrize("window", ["open", "closed", "unknown"])
+def test_cloud_send_without_gateway_preserves_transport_and_template(monkeypatch, tmp_path, scheduled, window):
+    import time
+    from gateway import whatsapp_chat_window
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if window != "unknown":
+        whatsapp_chat_window.record_inbound(tmp_path, "123", "456", int(time.time()) - (1 if window == "open" else 86401))
     monkeypatch.setattr(sends, "_live_adapter", lambda _: (None, None))
     config = PlatformConfig(extra={"phone_number_id": "123", "access_token": "test-token",
                                    "scheduled_template": {"name": "reminder", "language": "en"}})
@@ -36,8 +41,8 @@ def test_cloud_send_without_gateway_preserves_transport_and_template(monkeypatch
     assert request.kwargs["headers"]["Authorization"] == "Bearer test-token"
     payload = request.kwargs["json"]
     assert payload["to"] == "456"
-    assert payload["type"] == ("template" if scheduled else "text")
-    if scheduled:
+    assert payload["type"] == ("template" if scheduled and window == "closed" else "text")
+    if scheduled and window == "closed":
         assert payload["template"]["name"] == "reminder"
     else:
         assert payload["text"]["body"] == "Requested result"

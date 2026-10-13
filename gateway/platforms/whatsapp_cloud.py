@@ -372,7 +372,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         scheduled_template = (self.config.extra or {}).get("scheduled_template")
         if (metadata or {}).get("job_id") and scheduled_template:
-            return await self.send_template(chat_id, content, scheduled_template)
+            return await self.send_template(chat_id, content, scheduled_template, metadata=metadata)
         formatted = self.format_message(content)
         last_message_id: Optional[str] = None
         for idx, chunk in enumerate(self.truncate_message(formatted, self._outgoing_chunk_limit())):
@@ -394,8 +394,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             await rich_sent_store.record_async(chat_id, last_message_id, formatted)
         return SendResult(success=True, message_id=last_message_id)
 
-    async def send_template(self, chat_id: str, content: str, template: Dict[str, Any]) -> SendResult:
-        """Deliver an approved scheduled template with one body variable.
+    async def send_template(self, chat_id: str, content: str, template: Dict[str, Any], *, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """Deliver an approved scheduled template with an optional job-title header.
 
         Explicit configuration leaves ordinary replies free-form and avoids
         retrying an uncertain send as a second, potentially billable message.
@@ -406,10 +406,19 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         content = " ".join(content.split())
         if len(content) > 1024:
             return SendResult(success=False, error="Template update exceeds 1024 characters; use a concise summary with a link")
+        components = []
+        if template.get("header_source"):
+            if template["header_source"] != "job_name":
+                return SendResult(success=False, error="scheduled_template header_source must be job_name")
+            title = " ".join(str((metadata or {}).get("job_name") or "").split())
+            if not title:
+                return SendResult(success=False, error="Scheduled template requires the reminder title")
+            components.append({"type": "header", "parameters": [{"type": "text", "text": title[:60]}]})
+        components.append({"type": "body", "parameters": [{"type": "text", "text": content}]})
         payload = self._outbound_payload(chat_id, "template", {
             "name": template["name"],
             "language": {"code": template["language"]},
-            "components": [{"type": "body", "parameters": [{"type": "text", "text": content}]}],
+            "components": components,
         }, None)
         ids, err = await self._post_messages(
             payload,

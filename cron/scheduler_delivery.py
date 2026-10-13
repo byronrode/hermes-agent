@@ -1452,6 +1452,9 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         if thread_id:
             media_metadata["thread_id"] = thread_id
 
+    if t.platform == Platform.WHATSAPP_CLOUD:
+        route_metadata["job_name"] = _cron_display_name(job)
+
     # Relay egress needs metadata.scope_id (fail-closed tenant guard; scope cache is COLD after a
     # restart; router stamps HOME only). Origin targets only: a wrong fan-out scope is worse than
     # none.
@@ -1690,7 +1693,7 @@ def _standalone_send(
         return await asyncio.wait_for(_send_to_platform(
             t.platform, t.pconfig, t.chat_id, content, thread_id=t.thread_id,
             media_files=media_files,
-            **({"args": {"metadata": {"job_id": job["id"]}}}
+            **({"args": {"metadata": {"job_id": job["id"], "job_name": _cron_display_name(job)}}}
                if t.platform.value == "whatsapp_cloud" else {})), timeout=send_timeout)
 
     def _warned(msg: str) -> tuple[None, str]:

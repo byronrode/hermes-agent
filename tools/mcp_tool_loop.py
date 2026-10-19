@@ -16,7 +16,7 @@ import time
 from typing import Any, Coroutine, Optional
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_lifecycle as _lifecycle
-from tools.mcp_tool_deadline import MCPCallDeadlineExpired, remaining_timeout
+from tools.mcp_tool_deadline import MCPCallDeadlineExpired, current_deadline, remaining_timeout
 
 logger = logging.getLogger("tools.mcp_tool")
 
@@ -220,6 +220,21 @@ def _wait_for_server_session_ready(srv: Any, *, old_session: Any = None, timeout
     briefly None or stale; retrying blindly burns breaker strikes). With ``old_session`` the observed
     session must differ. The default iteration bound is retained; caller deadlines additionally cap each wait."""
     timeout = remaining_timeout(timeout)
+    if current_deadline() is not None:
+        stop = time.monotonic() + timeout
+        while True:
+            remaining_timeout()
+            session, ready = getattr(srv, 'session', None), getattr(srv, '_ready', None)
+            try:
+                is_ready = bool(ready.is_set()) if hasattr(ready, 'is_set') else True
+            except Exception:
+                is_ready = True
+            if session is not None and session is not old_session and is_ready:
+                return True
+            remaining = stop - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(remaining_timeout(min(0.25, remaining)))
     iterations = max(1, int(max(float(timeout), 0.0) / 0.25))
     for i in range(iterations):
         remaining_timeout()

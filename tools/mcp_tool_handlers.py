@@ -22,6 +22,8 @@ from tools.mcp_tool_content import (
     _render_mcp_dropped_block_notice, _render_mcp_resource_block, _strip_reserved_meta_keys,
     _truncate_mcp_text_result)
 from tools.mcp_tool_errors import _is_auth_error, _is_session_expired_error
+from tools.mcp_tool_deadline import (
+    MCPCallDeadlineExpired, call_deadline, current_deadline, remaining_timeout)
 
 logger = logging.getLogger("tools.mcp_tool")
 _MISSING = object()
@@ -182,6 +184,8 @@ def _retry_once(server_name: str, retry_call, op_description: str, what: str):
     None when the retry raised (caller falls through)."""
     try:
         result = retry_call()
+    except MCPCallDeadlineExpired:
+        raise
     except Exception as retry_exc:
         logger.warning("MCP %s/%s retry after %s failed: %s", server_name, op_description, what, retry_exc)
         return None
@@ -197,6 +201,8 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
     from tools.mcp_oauth_manager import get_manager
     try:
         recovered = _loop._run_on_mcp_loop(lambda: get_manager().handle_401(server_name, None), timeout=10)
+    except MCPCallDeadlineExpired:
+        raise
     except Exception as rec_exc:
         logger.warning("MCP OAuth '%s': recovery attempt failed: %s", server_name, rec_exc)
         recovered = False
@@ -315,6 +321,8 @@ def _handle_stdio_child_exited_and_retry(server_name: str, exc: Exception, retry
                 outcome_uncertain=True,
             )
         return _strike(server_name, _STDIO_DIED_AGAIN_MSG.format(s=server_name))
+    except MCPCallDeadlineExpired:
+        raise
     except Exception as retry_exc:
         logger.warning("MCP %s/%s retry after stdio respawn failed: %s", server_name, op_description, retry_exc)
         return _strike(server_name, _sanitize_error(
@@ -339,9 +347,13 @@ def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float,
         return _record_call_outcome(server_name, result) if record_outcome else result
     except InterruptedError:
         return tool_error("MCP call interrupted: user sent a new message")
+    except MCPCallDeadlineExpired:
+        raise
     except Exception as exc:
         for recover in recoverers:
+            remaining_timeout()
             recovered = recover(server_name, exc, call_once, op)
+            remaining_timeout()
             if recovered is not None:
                 return recovered
         on_final_failure(exc)
@@ -377,7 +389,8 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
             inflight.discard(task)
 
 
-async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict):
+async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict,
+                                       *, deadline_monotonic=None):
     """``session.call_tool`` that fails fast when the stdio child is/gets dead: pre-call (a dead
     child must not hold the slot for the full timeout) and mid-call (race against
     ``_watch_stdio_children``). Both raise :class:`_StdioChildExited` for the respawn path, which
@@ -391,7 +404,25 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
             f"MCP stdio subprocess for '{server_name}' had already exited when the call was dispatched",
             in_flight=False,
         )
-    _call_coro = server.session.call_tool(tool_name, arguments=args)
+    options = {} if deadline_monotonic is None else {
+        'read_timeout_seconds': remaining_timeout(deadline=deadline_monotonic)}
+    async def _bounded_sdk_call():
+        from mcp.shared.exceptions import MCPError
+        from mcp_types import REQUEST_TIMEOUT
+        try:
+            return await server.session.call_tool(tool_name, arguments=args, **options)
+        except MCPCallDeadlineExpired:
+            raise
+        except Exception as exc:
+            # SDK-local timeout races the outer future by a few scheduler ticks.
+            # A peer's REQUEST_TIMEOUT alone is not proof of our budget expiring.
+            if (isinstance(exc, MCPError) and exc.code == REQUEST_TIMEOUT
+                    and isinstance(exc.__context__, TimeoutError)):
+                raise MCPCallDeadlineExpired('MCP caller deadline expired') from None
+            remaining_timeout(deadline=deadline_monotonic)
+            raise
+    _call_coro = (_bounded_sdk_call() if deadline_monotonic is not None
+                  else server.session.call_tool(tool_name, arguments=args))
     _watch_children = getattr(server, "_watch_stdio_children", None)
     if not (inspect.iscoroutinefunction(_watch_children) and asyncio.iscoroutine(_call_coro)):
         # Stubbed sessions return a non-awaitable, or there is no child-watcher to race: plain await.
@@ -410,6 +441,8 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
             )
         try:
             return await rpc_task
+        except MCPCallDeadlineExpired:
+            raise
         except Exception as exc:
             # The SDK usually sees the closed pipe before the 250 ms watcher poll does. On a stdio
             # server a transport-closure error after dispatch is the same ambiguous mid-call death;
@@ -556,7 +589,18 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Sync registry handler (``handler(args_dict, **kwargs) -> str``) calling an MCP tool via the background loop."""
     op = f"tools/call {tool_name}"
 
-    def _handler(args: dict, **kwargs) -> str:
+    def _handler(args: dict, *, deadline_monotonic=None, **kwargs) -> str:
+        try:
+            with call_deadline(deadline_monotonic):
+                result = _execute(args, **kwargs)
+                remaining_timeout()
+                return result
+        except MCPCallDeadlineExpired:
+            # Cancellation does not establish that a write never reached its server.
+            return tool_error('MCP caller deadline expired', deadline_exceeded=True,
+                              outcome_uncertain=not _tool_is_read_only(server_name, tool_name))
+
+    def _execute(args: dict, **kwargs) -> str:
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:
@@ -567,12 +611,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # Only a tool annotated readOnlyHint=True is replayed after session expiry; a 401 is always
         # pre-dispatch so the auth recoverer keeps its retry for every tool.
         read_only = _tool_is_read_only(server_name, tool_name)
+        deadline = current_deadline()
 
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
-                    result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
+                    options = {} if deadline is None else {'deadline_monotonic': deadline}
+                    result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args, **options)
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy

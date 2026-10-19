@@ -242,6 +242,33 @@ retention is bounded by age and count.
 
 Tool calls may execute sequentially or concurrently depending on the tool mix and interaction requirements.
 
+### Bounded MCP consumers
+
+An application making a registered MCP tool call can pass an absolute monotonic
+deadline as execution metadata:
+
+```python
+registry.dispatch(tool_name, arguments, deadline_monotonic=time.monotonic() + 10)
+```
+
+This keyword is not a model argument and is never forwarded in the tool's
+arguments. The MCP handler preserves trust approval, profile scope, circuit
+checks and recovery. Its context-local deadline clamps connection readiness,
+RPC waits and recovery to the remaining budget, without extending configured
+timeouts or affecting other calls. The SDK receives `read_timeout_seconds`;
+expiry cancels only the scheduled request, stops retries and returns
+`deadline_exceeded: true`. It is not a provider-health failure. A timed-out write
+retains `outcome_uncertain: true`; cancellation never proves a write did not run.
+Human approval remains its own interaction and is not bypassed by a deadline.
+Calls without this keyword retain their configured behavior.
+
+Consumers that include connector discovery in the same budget can use
+`tools.mcp_tool_deadline.call_deadline(deadline_monotonic)` as a context manager
+around discovery and registered reads. Nested scopes can only shorten the
+parent deadline. Importing this API before discovery also provides a capability
+check: an older runtime lacking it should be reported unavailable instead of
+silently issuing an unbounded read.
+
 ## Related docs
 
 - [Toolsets Reference](../reference/toolsets-reference.md)

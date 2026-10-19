@@ -18,6 +18,7 @@ from tools import mcp_tool_lifecycle as _lifecycle
 from tools import mcp_tool_loop as _loop
 from tools import mcp_tool_registration as _registration
 from tools.mcp_tool_schema import MCP_TOOL_NAME_PREFIX
+from tools.mcp_tool_deadline import MCPCallDeadlineExpired
 from tools.mcp_tool_scope import _key_name, _key_scope, _key_visible_in_scope, _resolve_server_key, _server_key
 
 logger = logging.getLogger("tools.mcp_tool")
@@ -174,6 +175,8 @@ def _request_lazy_reconnect(server_name: str, server: _core.MCPServerTask) -> bo
 
     try:
         return bool(_loop._run_on_mcp_loop(_await_ready, timeout=_core._RECYCLED_RECONNECT_TIMEOUT))
+    except MCPCallDeadlineExpired:
+        raise
     except Exception as exc:
         logger.warning("MCP server '%s': lazy reconnect after stdio recycle failed: %s", server_name, exc)
         return False
@@ -240,6 +243,11 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     try:
         _loop._run_on_mcp_loop(lambda: _discover_and_register_server(server_name, config),
                                timeout=float(connect_timeout) + 30.0)
+    except MCPCallDeadlineExpired:
+        # The caller stopped waiting; do not park a healthy server in cooldown.
+        with _core._lock:
+            _core._server_connecting.discard(key)
+        raise
     except BaseException as exc:
         logger.warning("Lazy MCP connect failed for '%s': %s", server_name, _note_connect_failure(server_name, exc))
         return False

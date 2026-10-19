@@ -204,10 +204,10 @@ def test_subinterval_readiness_retains_available_budget():
     def ready():
         server.session = object()
         server._ready.set()
-    timer = threading.Timer(0.05, ready)
+    timer = threading.Timer(0.1, ready)
     timer.start()
     try:
-        with call_deadline(time.monotonic() + 2):
-            assert loop._wait_for_server_session_ready(server, timeout=0.24) is True
+        with call_deadline(time.monotonic() + 0.24):
+            assert loop._wait_for_server_session_ready(server, timeout=15) is True
     finally:
         timer.join(timeout=2)

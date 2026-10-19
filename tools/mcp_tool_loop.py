@@ -234,7 +234,7 @@ def _wait_for_server_session_ready(srv: Any, *, old_session: Any = None, timeout
             remaining = stop - time.monotonic()
             if remaining <= 0:
                 return False
-            time.sleep(remaining_timeout(min(0.25, remaining)))
+            time.sleep(remaining_timeout(min(0.05, remaining)))
     iterations = max(1, int(max(float(timeout), 0.0) / 0.25))
     for i in range(iterations):
         remaining_timeout()

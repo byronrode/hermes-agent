@@ -18,6 +18,7 @@ from tools import mcp_tool_lifecycle as _lifecycle
 from tools import mcp_tool_loop as _loop
 from tools import mcp_tool_registration as _registration
 from tools.mcp_tool_schema import MCP_TOOL_NAME_PREFIX
+from tools.mcp_tool_deadline import MCPCallDeadlineExpired, remaining_timeout
 from tools.mcp_tool_scope import _key_name, _key_scope, _key_visible_in_scope, _resolve_server_key, _server_key
 
 logger = logging.getLogger("tools.mcp_tool")
@@ -174,6 +175,8 @@ def _request_lazy_reconnect(server_name: str, server: _core.MCPServerTask) -> bo
 
     try:
         return bool(_loop._run_on_mcp_loop(_await_ready, timeout=_core._RECYCLED_RECONNECT_TIMEOUT))
+    except MCPCallDeadlineExpired:
+        raise
     except Exception as exc:
         logger.warning("MCP server '%s': lazy reconnect after stdio recycle failed: %s", server_name, exc)
         return False
@@ -240,6 +243,11 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     try:
         _loop._run_on_mcp_loop(lambda: _discover_and_register_server(server_name, config),
                                timeout=float(connect_timeout) + 30.0)
+    except MCPCallDeadlineExpired:
+        # The caller stopped waiting; do not park a healthy server in cooldown.
+        with _core._lock:
+            _core._server_connecting.discard(key)
+        raise
     except BaseException as exc:
         logger.warning("Lazy MCP connect failed for '%s': %s", server_name, _note_connect_failure(server_name, exc))
         return False
@@ -437,6 +445,11 @@ def _run_discovery_pass(new_servers: Dict[str, dict]) -> None:
         waves = max(1, -(-len(new_servers) // cap))
         timeout = min(120 * waves, _core._MCP_DISCOVERY_PASS_MAX_SEC)
         _loop._run_on_mcp_loop(lambda: _discover_all(new_servers), timeout=timeout)
+    except MCPCallDeadlineExpired:
+        with _core._lock:
+            for name in new_servers:
+                _core._server_connecting.discard(_server_key(name))
+        raise
     except (TimeoutError, InterruptedError) as _e:
         # Stranded _server_connecting entries would block future reconnects.
         how = "timed out" if isinstance(_e, TimeoutError) else "interrupted"
@@ -529,12 +542,14 @@ def _register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 def _acquire_discovery_lock_with_retry():
     """Cross-process guard: a lock loser waits for the holder then discovers itself; unavailable
     locking or an expired wait runs unguarded (fail-soft). None / _LOCK_UNAVAILABLE = unguarded."""
+    remaining_timeout()
     cookie = _loop._try_acquire_mcp_discovery_lock()
     if cookie is not None:
         return cookie
     logger.debug("Another process holds MCP discovery lock -- retrying with backoff")
     for _ in range(_core._MCP_DISCOVERY_LOCK_MAX_RETRIES):
-        time.sleep(_core._MCP_DISCOVERY_LOCK_RETRY_DELAY_S)
+        time.sleep(remaining_timeout(_core._MCP_DISCOVERY_LOCK_RETRY_DELAY_S))
+        remaining_timeout()
         cookie = _loop._try_acquire_mcp_discovery_lock()
         if cookie is not None:
             break

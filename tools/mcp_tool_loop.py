@@ -16,6 +16,7 @@ import time
 from typing import Any, Coroutine, Optional
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_lifecycle as _lifecycle
+from tools.mcp_tool_deadline import MCPCallDeadlineExpired, current_deadline, remaining_timeout
 
 logger = logging.getLogger("tools.mcp_tool")
 
@@ -151,6 +152,13 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     from tools.interrupt import is_interrupted
     from agent.async_utils import safe_schedule_threadsafe
 
+    try:
+        timeout = remaining_timeout(timeout)
+    except MCPCallDeadlineExpired:
+        if asyncio.iscoroutine(coro_or_factory):
+            coro_or_factory.close()
+        raise
+
     loop = _running_loop()
     if loop is None:
         if asyncio.iscoroutine(coro_or_factory):
@@ -172,6 +180,7 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
         remaining = 0.1 if deadline is None else deadline - time.monotonic()
         if remaining <= 0:
             future.cancel()
+            remaining_timeout()  # distinguish caller expiry from provider timeout
             raise TimeoutError(f"MCP call timed out after {time.monotonic() - start_time:.1f}s "
                                f"(configured timeout: {float(timeout):.1f}s)")
         try:
@@ -209,9 +218,26 @@ def reconnect_mcp_server(server_name: str) -> bool:
 def _wait_for_server_session_ready(srv: Any, *, old_session: Any = None, timeout: float = 15.0) -> bool:
     """Poll until the server exposes a usable, ready session (during a reconnect ``srv.session`` is
     briefly None or stale; retrying blindly burns breaker strikes). With ``old_session`` the observed
-    session must differ. Iteration-bounded, not deadline-bounded: tests freeze ``time.monotonic``."""
+    session must differ. The default iteration bound is retained; caller deadlines additionally cap each wait."""
+    timeout = remaining_timeout(timeout)
+    if current_deadline() is not None:
+        stop = time.monotonic() + timeout
+        while True:
+            remaining_timeout()
+            session, ready = getattr(srv, 'session', None), getattr(srv, '_ready', None)
+            try:
+                is_ready = bool(ready.is_set()) if hasattr(ready, 'is_set') else True
+            except Exception:
+                is_ready = True
+            if session is not None and session is not old_session and is_ready:
+                return True
+            remaining = stop - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(remaining_timeout(min(0.05, remaining)))
     iterations = max(1, int(max(float(timeout), 0.0) / 0.25))
     for i in range(iterations):
+        remaining_timeout()
         session = getattr(srv, "session", None)
         ready = getattr(srv, "_ready", None)
         try:
@@ -221,7 +247,7 @@ def _wait_for_server_session_ready(srv: Any, *, old_session: Any = None, timeout
         if session is not None and session is not old_session and is_ready:
             return True
         if i < iterations - 1:
-            time.sleep(0.25)
+            time.sleep(remaining_timeout(0.25))
     return False
 
 

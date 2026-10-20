@@ -19,7 +19,7 @@ from gateway.status_phrases import format_activity_status
 def test_status_uses_observations_without_relaying_private_text(tool, description, provenance, expected):
     text = format_activity_status({
         "current_tool": tool, "last_activity_desc": description,
-        "last_activity_provenance": provenance, "api_call_count": 4,
+        "last_activity_provenance": provenance, "api_call_count": 40, "budget_used": 4,
         "seconds_since_activity": 185, "max_iterations": 90,
         "args": {"secret": "private credentials"},
     }, elapsed_minutes=12)
@@ -48,7 +48,7 @@ async def test_platform_config_drives_contextual_delivery_and_stops_with_executo
     source = SessionSource(platform=Platform.WHATSAPP_CLOUD, chat_id="test-chat", chat_type="dm")
     agent = MagicMock()
     agent.get_activity_summary.return_value = {
-        "current_tool": "web_search", "api_call_count": 7,
+        "current_tool": "web_search", "api_call_count": 70, "budget_used": 7,
         "last_activity_desc": "private search query", "seconds_since_activity": 1,
     }
     runner._running_agents = {"sess": agent}

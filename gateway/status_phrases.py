@@ -55,7 +55,7 @@ def format_activity_status(activity: Mapping[str, Any] | None, *, elapsed_minute
         elif description.startswith(("API error recovery", "stream retry", "stale stream detected")):
             label = "Retrying the AI service after a response problem"
     details = [f"{max(0, elapsed_minutes)} min elapsed"]
-    calls = activity.get("api_call_count")
+    calls = activity.get("budget_used")
     if isinstance(calls, int) and not isinstance(calls, bool) and calls > 0:
         details.append(f"{calls} model requests so far")
     age = activity.get("seconds_since_activity")

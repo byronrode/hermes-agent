@@ -48,7 +48,8 @@ def format_activity_status(activity: Mapping[str, Any] | None, *, elapsed_minute
     elif isinstance(description, str):
         if activity.get("last_activity_provenance") == "agent.compression":
             label = "Condensing the conversation history"
-        elif description.startswith(("waiting for provider response", "waiting for non-streaming API response")):
+        elif description.startswith(("waiting for provider response", "waiting for stream response",
+                                     "waiting for non-streaming API response")):
             label = "Waiting for the AI service to respond"
         elif description.startswith(("receiving stream response", "starting API call #", "API call #")):
             label = "Processing the AI response"

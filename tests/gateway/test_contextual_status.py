@@ -13,6 +13,8 @@ from gateway.status_phrases import format_activity_status
     ("web_search", "private query", "unknown", "Searching the web"),
     ("private_plugin_name", "private query", "unknown", "Waiting for a tool result"),
     (None, "waiting for provider response (private details)", "unknown", "Waiting for the AI service"),
+    (None, "waiting for stream response (private first_chunk)", "unknown", "Waiting for the AI service"),
+    (None, "waiting for stream response (private reconnect)", "unknown", "Waiting for the AI service"),
     (None, "private conversation", "agent.compression", "Condensing the conversation"),
     (None, "private unknown state", "unknown", "Current activity is unavailable"),
 ])

@@ -2985,8 +2985,8 @@ class GatewayTurnMixin:
                 ):
                     return "off"
             value = resolve_display_setting(user_config, platform_key, setting, default)
-            if isinstance(value, str) and value.strip().lower() == "generic":
-                return "generic" if allow_generic else "off"
+            if isinstance(value, str) and value.strip().lower() in {"generic", "contextual"}:
+                return value.strip().lower() if allow_generic else "off"
             return "raw" if bool(value) else "off"
 
         def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
@@ -4156,7 +4156,8 @@ class GatewayTurnMixin:
         Interval: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL (default 180s; 0 or
         long_running_notifications=off disables)."""
         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
-        _notify_start = time.time()
+        from gateway.status_phrases import format_activity_status
+        _notify_start = time.monotonic()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
         if _NOTIFY_INTERVAL <= 0 or _long_running_mode == "off":
@@ -4173,7 +4174,7 @@ class GatewayTurnMixin:
                 session_key, agent_holder[0], _executor_task_holder[0]
             ):
                 break
-            _elapsed_mins = int((time.time() - _notify_start) // 60)
+            _elapsed_mins = int((time.monotonic() - _notify_start) // 60)
             # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
             _status_detail = ""
             _want_iteration_detail = bool(
@@ -4191,7 +4192,9 @@ class GatewayTurnMixin:
                     if _parts:
                         _status_detail = " — " + ", ".join(_parts)
             _heartbeat_text = (
-                disp._generic_status_phrase("status")
+                format_activity_status(_a, elapsed_minutes=_elapsed_mins)
+                if _long_running_mode == "contextual"
+                else disp._generic_status_phrase("status")
                 if _long_running_mode == "generic"
                 else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
             )

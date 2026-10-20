@@ -26,6 +26,43 @@ _CONVENTIONAL_RELATIVE_PATHS = ("status_phrases.yaml", "status_phrases")
 _YAML_SUFFIXES = {".yaml", ".yml"}
 _CONFIG_KEYS = ("generic_status_phrases", "status_phrases")  # legacy alias first
 
+_TOOL_ACTIVITIES = {
+    "web_search": "Searching the web",
+    "web_extract": "Reading web sources",
+    "read_file": "Reading project files",
+    "search_files": "Searching project files",
+    "terminal": "Running a command or checking a service",
+    "delegate_task": "Waiting for delegated work",
+    "transcribe_audio": "Transcribing audio",
+}
+
+
+def format_activity_status(activity: Mapping[str, Any] | None, *, elapsed_minutes: int) -> str:
+    """Describe observed activity using closed labels; never relay scratch text or tool arguments."""
+    activity = activity or {}
+    tool = activity.get("current_tool")
+    description = activity.get("last_activity_desc") or ""
+    label = "Current activity is unavailable"
+    if isinstance(tool, str) and tool:
+        label = _TOOL_ACTIVITIES.get(tool, "Waiting for a tool result")
+    elif isinstance(description, str):
+        if activity.get("last_activity_provenance") == "agent.compression":
+            label = "Condensing the conversation history"
+        elif description.startswith(("waiting for provider response", "waiting for non-streaming API response")):
+            label = "Waiting for the AI service to respond"
+        elif description.startswith(("receiving stream response", "starting API call #", "API call #")):
+            label = "Processing the AI response"
+        elif description.startswith(("API error recovery", "stream retry", "stale stream detected")):
+            label = "Retrying the AI service after a response problem"
+    details = [f"{max(0, elapsed_minutes)} min elapsed"]
+    calls = activity.get("api_call_count")
+    if isinstance(calls, int) and not isinstance(calls, bool) and calls > 0:
+        details.append(f"{calls} model requests so far")
+    age = activity.get("seconds_since_activity")
+    if isinstance(age, (int, float)) and age >= 60:
+        details.append(f"last activity report {int(age // 60)} min ago")
+    return f"{label} — {', '.join(details)}. No reliable completion estimate yet."
+
 _FALLBACK_PHRASES: dict[str, list[str]] = {
     "status": ["still on it", "still working through it", "waiting for the result"],
     "generic": ["on it", "one sec", "checking that now"],

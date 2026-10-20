@@ -151,7 +151,9 @@ def _norm_bool(value: Any) -> bool:
 
 
 def _norm_long_running(value: Any) -> Any:
-    return "generic" if isinstance(value, str) and value.strip().lower() == "generic" else _norm_bool(value)
+    if isinstance(value, str) and value.strip().lower() in {"generic", "contextual"}:
+        return value.strip().lower()
+    return _norm_bool(value)
 
 
 def _norm_suppress_warning_notifications(value: Any) -> bool:

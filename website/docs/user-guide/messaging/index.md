@@ -482,6 +482,15 @@ Setting `display.tool_progress: log` sends **no** progress bubbles to chat. Inst
 
 ### Configurable status phrases
 
+Set `display.long_running_notifications: contextual` to report observed activity,
+elapsed time, model request count and the age of an older activity report instead
+of a stock reassurance. Activity uses fixed labels; raw commands, tool arguments
+and model reasoning are never included. Request counts are not percent complete,
+and the message explicitly states that no reliable completion estimate is available.
+Enable `display.interim_assistant_messages: true` for the assistant's explanations
+of what it is investigating, separately from these automatic status reports.
+Both settings can be scoped under `display.platforms.<platform>`.
+
 Long-running gateway status lines ("still working…"-style heartbeats) draw from a phrase catalog. Built-in defaults ship in `gateway/assets/status_phrases.yaml`; you can add your own with profile-portable files under `HERMES_HOME`:
 
 - `~/.hermes/status_phrases.yaml` or any `*.yaml` in `~/.hermes/status_phrases/` (conventional paths, auto-loaded), or

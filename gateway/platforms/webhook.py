@@ -162,6 +162,7 @@ class WebhookAdapter(BasePlatformAdapter):
     interactive_resume: bool = False
     # ``/p/<profile>/webhooks/<route>`` on the shared listener (``_resolve_request_profile``).
     serves_profile_prefix: bool = True
+    supports_scheduled_delivery_metadata: bool = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WEBHOOK)
@@ -921,6 +922,15 @@ class WebhookAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=f"No chat_id or home channel for {platform_name}")
                 chat_id = home.chat_id
             thread_id = extra.get("message_thread_id") or extra.get("thread_id")  # Telegram forum topics
+            metadata = {"thread_id": thread_id} if thread_id else {}
+            for key, limit in (("job_id", 160), ("job_name", 60)):
+                value = extra.get(key)
+                if value is not None:
+                    if not isinstance(value, str) or not value.strip() or len(value) > limit:
+                        return SendResult(success=False, error=f"Invalid scheduled delivery {key}")
+                    metadata[key] = value
+            if "job_name" in metadata and "job_id" not in metadata:
+                return SendResult(success=False, error="Scheduled delivery job_name requires job_id")
             result = None
             if delivery.get("discussion_actions") is True:
                 from gateway.platforms.webhook_actions import restore
@@ -928,7 +938,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 from gateway.platforms.webhook_actions import deliver
                 result = await deliver(self, adapter, target_platform, chat_id, thread_id, content, delivery)
             if result is None:
-                result = await adapter.send(chat_id, content, metadata={"thread_id": thread_id} if thread_id else None)
+                result = await adapter.send(chat_id, content, metadata=metadata or None)
             if result.success:
                 self._mirror_delivery(platform_name, str(chat_id), content, delivery, thread_id)
             return result

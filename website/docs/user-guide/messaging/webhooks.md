@@ -267,6 +267,15 @@ webhooks:
 
 If `chat_id` is not provided in `deliver_extra`, the delivery falls back to the home channel configured for the target platform.
 
+For an explicitly authorised scheduled notification, `deliver_extra.job_id` and
+optional `job_name` pass through to the target adapter's existing scheduled
+delivery path. They support the same signed-payload templates as other delivery
+fields; ordinary webhook messages omit them. This does not create a cron job or
+register a provider template. For WhatsApp Cloud, configure an already approved
+`scheduled_template` on that profile and keep its concise update within the
+adapter's 1,024-character template-variable limit. A report-link notice alone
+does not establish that a report's exact proposal scopes have been shown or approved.
+
 ---
 
 ## GitHub PR Review (Step by Step) {#github-pr-review}

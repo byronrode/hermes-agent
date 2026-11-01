@@ -488,6 +488,42 @@ Statuses are retained briefly after terminal states (`completed`, `failed`, `can
 
 While the gateway is still draining (a `hermes gateway stop`/`restart` or SIGTERM with a turn in flight), every non-terminal run additionally carries `shutdown_requested_at` (Unix seconds) from the moment new turns are refused. `status` stays `running` because the turn is still being served; a poller that sees the field knows the process is on its way out and the run will end `interrupted` at the latest when the drain budget expires. Terminal runs never gain the field.
 
+### Accepted source and original-session result (personal Mara fork)
+
+`GET /v1/runs/{run_id}/accepted-source` requires the original authenticated
+API scope and an idempotent, durable admission. Admission-only metadata lives
+on the existing reservation row; status updates cannot replace it. The owner
+checks the original body fingerprint, run/session, principal, accepted time and
+current process epoch. It returns hashes/identifiers, the fixed single-role
+status intent, and the actual owner revision/epoch. No prompt, API key or
+idempotency key is returned. Room grants, caller history, rich/list input,
+forwarded Bot Chat ownership, cancelled/foreign/malformed records and unknown
+intents remain unavailable. A ContextVar or copied hook JSON is unnecessary.
+
+This readback is **not proof of OS isolation**. A model with the owner's UID can
+write a 0600 registry or mutable source. A protected consumer must independently
+qualify immutable source, registry/process integrity and the authenticated route
+before granting this owner source-attestation authority.
+
+`POST /v1/runs/{run_id}/source-result` accepts only `{}` under that original
+scope. It never accepts answer text, proof, a destination or a request UUID.
+The opt-in `platforms.api_server.extra.source_result_transport: {host: ignis-one}`
+uses only the registered `~/.local/share/mara-host-agent/current` client and its
+existing config, fixed `role-status-source` action and `read` phase. There is no
+arbitrary command or URL setting. Missing composition returns unavailable.
+The child environment contains only HOME/PATH, and its bounded 3.5-second
+lifecycle cannot start a model turn. The protected host independently reads
+native proof/source/callback and must return this exact accepted source.
+
+Queued is not delivered. An answered result uses the existing detached-delivery
+transaction and stable request identity to append an attributed assistant
+`role_status_result` row. Busy turns defer. Exact retries, including compression
+lineage, return the same row; changed content or source metadata fails closed.
+The owner reads the persisted row back before returning `state: persisted` and
+its message ID. This proves transcript persistence, not phone display or APNs
+delivery. The existing Mara periodic notification owner triggers readback for
+pending admitted runs; this API installs no poller, daemon or new model tool.
+
 ### GET /v1/runs/\{run_id\}/events
 
 Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.

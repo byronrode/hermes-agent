@@ -1099,6 +1099,17 @@ group_sessions_per_user: true
 # can discover them without manual coordination.  Caller authentication is
 # unchanged: every request still authenticates with the global API server
 # key (``extra.key`` / API_SERVER_KEY).
+#
+# Personal Mara fork only: bounded original-session role-result readback is
+# disabled unless the existing protected host transport has been independently
+# qualified. It has no company credentials or arbitrary command/URL setting:
+# platforms:
+#   api_server:
+#     extra:
+#       source_result_transport:
+#         host: ignis-one
+# Configuration alone does not isolate the source owner/registry from model
+# tools or provision native company grants. See the Runs API source contract.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gateway Streaming

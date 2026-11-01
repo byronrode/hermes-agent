@@ -333,13 +333,23 @@ class SessionMessagesMixin:
         The event's unit id, not its text or active flag, is the identity. Check and insert
         share the writer transaction, so independent gateway processes cannot duplicate it.
         """
+        return self._append_detached_delivery(session_id, content, metadata, "user",
+            "hidden" if metadata.get("presentation_suppressed") else "async_delegation_complete")
+
+    def append_role_result_delivery(self, session_id: str, content: str, metadata: Dict[str, Any]) -> int:
+        """An attributed source result is an assistant presentation, never a new user turn."""
+        if metadata.get('role') not in {'cto', 'cpo', 'ciso', 'support'} or not metadata.get('source_reference'):
+            raise ValueError('Role result requires attributed source metadata')
+        return self._append_detached_delivery(session_id, content, metadata, 'assistant', 'role_status_result')
+
+    def _append_detached_delivery(self, session_id, content, metadata, role, kind):
         delegation_id = metadata.get("delegation_id")
         if not delegation_id:
             raise ValueError("Delegation delivery requires a stable delegation_id")
         msg = {"content": content,
-               "display_kind": "hidden" if metadata.get("presentation_suppressed") else "async_delegation_complete",
+               "display_kind": kind,
                "display_metadata": metadata}
-        params = self._message_row_params(session_id, "user", msg, None, time.time(), keep_reasoning=True)
+        params = self._message_row_params(session_id, role, msg, None, time.time(), keep_reasoning=True)
 
         def _do(conn):
             existing = conn.execute(
@@ -347,12 +357,16 @@ class SessionMessagesMixin:
                     SELECT ? UNION
                     SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id = l.id
                     JOIN sessions p ON p.id = s.parent_session_id WHERE p.end_reason = 'compression'
-                ) SELECT m.id FROM messages m JOIN lineage l ON m.session_id = l.id
-                WHERE m.display_kind IN ('async_delegation_complete', 'hidden')
+                ) SELECT m.id, m.role, m.content, m.display_metadata, m.display_kind FROM messages m JOIN lineage l ON m.session_id = l.id
+                WHERE m.display_kind IN ('async_delegation_complete', 'hidden', 'role_status_result')
                 AND json_extract(m.display_metadata, '$.delegation_id') = ?
                 AND coalesce(json_extract(m.display_metadata, '$.delivery_notice'), '') = ? LIMIT 1""",
                 (session_id, delegation_id, metadata.get("delivery_notice", ""))).fetchone()
             if existing is not None:
+                if kind == 'role_status_result' and (existing[1] != role or existing[4] != kind
+                        or self._decode_content(existing[2]) != content
+                        or json.loads(existing[3]) != metadata):
+                    raise ValueError('Detached role result identity already binds another result')
                 return existing[0]
             self._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid

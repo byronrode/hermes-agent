@@ -501,6 +501,7 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    accepted_source_resolver: Optional[Callable] = None
 
     @property
     def approval_session_key(self) -> str:
@@ -739,6 +740,13 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         turn_author=turn_author)
+    from gateway.platforms.api_server_accepted_source import admission_resolver
+    from hermes_cli.profiles import get_active_profile_name
+    launch.accepted_source_resolver = admission_resolver(
+        self, scope=idempotency_scope, key=idempotency_key, fingerprint=idempotency_fingerprint,
+        run_id=run_id, session_id=session_id, profile=get_active_profile_name(),
+        message=user_message,
+        authenticated=bool(self._expected_api_key()) and not bool(self._room_grant_token(request)))
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
@@ -827,9 +835,11 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
-            r = agent.run_conversation(
-                user_message=run.user_message, conversation_history=run.conversation_history,
-                task_id=effective_task_id, **author_kwargs)
+            from gateway.platforms.api_server_accepted_source import accepted_run_scope
+            with accepted_run_scope(run.accepted_source_resolver):
+                r = agent.run_conversation(
+                    user_message=run.user_message, conversation_history=run.conversation_history,
+                    task_id=effective_task_id, **author_kwargs)
         finally:
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)

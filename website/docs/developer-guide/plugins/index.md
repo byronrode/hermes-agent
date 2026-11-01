@@ -1107,6 +1107,11 @@ The **API request hooks** are observers for the raw provider request, one level 
 
 ### `pre_llm_call` context injection
 
+Qualified API runs also supply optional owner-verified `accepted_api_run`
+metadata. See [accepted API source metadata](../accepted-api-source.md) for
+the in-process source-owner interface, qualification limits and separation
+from company permission and attester credentials.
+
 This is the only hook whose return value matters. When a `pre_llm_call` callback returns a dict with a `"context"` key (or a plain string), Hermes injects that text into the **current turn's user message**. This is the mechanism for memory plugins, RAG integrations, guardrails, and any plugin that needs to provide the model with additional context.
 
 #### Return format

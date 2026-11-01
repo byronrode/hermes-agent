@@ -81,6 +81,8 @@ _CAPABILITY_ENDPOINTS = (
     ("chat_completions", ("POST", "/v1/chat/completions")),
     ("responses", ("POST", "/v1/responses")), ("runs", ("POST", "/v1/runs")),
     ("run_status", ("GET", "/v1/runs/{run_id}")),
+    ("run_source_receipt", ("GET", "/v1/runs/{run_id}/accepted-source")),
+    ("run_source_result", ("POST", "/v1/runs/{run_id}/source-result")),
     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
     ("run_steer", ("POST", "/v1/runs/{run_id}/steer")),
@@ -1641,6 +1643,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
+            ("GET", "/v1/runs/{run_id}/accepted-source", self._handle_run_source_receipt),
+            ("POST", "/v1/runs/{run_id}/source-result", self._handle_run_source_result),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
             # Platform event ingress: authenticated by the target adapter's own verifier,
             # NOT API_SERVER_KEY (external platforms hold no API server key).
@@ -4226,6 +4230,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         _api_runs._release_run_owner_if_forgotten(self, run_id)
 
     _handle_get_run = _run_route_delegate("_handle_get_run")
+
+    async def _handle_run_source_receipt(self, request):
+        from gateway.platforms.api_server_source_receipts import handle_source
+        return await handle_source(self, request)
+
+    async def _handle_run_source_result(self, request):
+        from gateway.platforms.api_server_source_receipts import handle_result
+        return await handle_result(self, request)
     _handle_run_events = _run_route_delegate("_handle_run_events")
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
     _handle_steer_run = _run_route_delegate("_handle_steer_run")

@@ -29,6 +29,8 @@ _EXTEND_RETENTION_BY_RUN = (
     "WHERE scope=? AND run_id=?")
 # Columns added after the first schema shipped; applied when missing.
 _MIGRATIONS = {
+    "accepted_source_json": "TEXT",
+    "source_result_json": "TEXT",
     "owner_pid": "INTEGER NOT NULL DEFAULT 0",
     "owner_started": "INTEGER NOT NULL DEFAULT 0",
     "retention_until": "REAL NOT NULL DEFAULT 0",
@@ -131,7 +133,8 @@ class RunIdempotencyStore:
                 raise
 
     def reserve(self, scope: str, key: str, fingerprint: str, run_id: str, status: Dict[str, Any], *,
-                owner_pid: int = 0, owner_started: int = 0, retention_until: float = 0):
+                owner_pid: int = 0, owner_started: int = 0, retention_until: float = 0,
+                accepted_source: dict | None = None):
         """Atomically reserve a key; return ``(outcome, stored_record)``."""
         now = time.time()
         retention_until = max(0.0, float(retention_until or 0))
@@ -147,10 +150,10 @@ class RunIdempotencyStore:
             self._conn.execute(
                 "INSERT INTO run_idempotency("
                 "scope,idempotency_key,fingerprint,run_id,status_json,"
-                "owner_pid,owner_started,retention_until,created_at,updated_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "owner_pid,owner_started,retention_until,created_at,updated_at,accepted_source_json"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (scope, key, fingerprint, run_id, encoded, int(owner_pid or 0), int(owner_started or 0),
-                 retention_until, now, now))
+                 retention_until, now, now, _encode_status(accepted_source) if accepted_source else None))
             self._conn.commit()
             return "created", _record(run_id, encoded, owner_pid, owner_started, now) | {"status": status}
 
@@ -227,3 +230,35 @@ class RunIdempotencyStore:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def accepted_source_for_run(self, scope: str, run_id: str) -> dict | None:
+        """Admission-only data; status updates cannot replace it. OS integrity is separate."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT accepted_source_json, fingerprint, status_json, owner_pid, owner_started "
+                "FROM run_idempotency WHERE scope=? AND run_id=?", (scope, run_id)).fetchone()
+        if row is None or not row[0]:
+            return None
+        return {"source": json.loads(row[0]), "fingerprint": row[1], "status": json.loads(row[2]),
+                "owner_pid": row[3], "owner_started": row[4]}
+
+    def source_result_for_run(self, scope: str, run_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute('SELECT source_result_json FROM run_idempotency WHERE scope=? AND run_id=?',
+                                     (scope, run_id)).fetchone()
+        return json.loads(row[0]) if row and row[0] else None
+
+    def remember_source_result(self, scope: str, run_id: str, source: dict, result: dict) -> None:
+        """First validated result shares the accepted reservation, before a busy transcript defers it."""
+        with self._immediate_txn():
+            row = self._conn.execute('SELECT accepted_source_json, source_result_json FROM run_idempotency '
+                                     'WHERE scope=? AND run_id=?', (scope, run_id)).fetchone()
+            original = {k:v for k,v in source.items() if k not in {'owner_pid','owner_started','owner_revision'}}
+            if not row or not row[0] or json.loads(row[0]) != original:
+                raise ValueError('Accepted source changed before pending result')
+            if row[1] and json.loads(row[1]) != result:
+                raise ValueError('Source result identity already binds another result')
+            if not row[1]:
+                self._conn.execute('UPDATE run_idempotency SET source_result_json=? WHERE scope=? AND run_id=?',
+                                   (_encode_status(result), scope, run_id))
+            self._conn.commit()

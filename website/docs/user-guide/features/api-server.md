@@ -488,6 +488,50 @@ Statuses are retained briefly after terminal states (`completed`, `failed`, `can
 
 While the gateway is still draining (a `hermes gateway stop`/`restart` or SIGTERM with a turn in flight), every non-terminal run additionally carries `shutdown_requested_at` (Unix seconds) from the moment new turns are refused. `status` stays `running` because the turn is still being served; a poller that sees the field knows the process is on its way out and the run will end `interrupted` at the latest when the drain budget expires. Terminal runs never gain the field.
 
+### Accepted source and original-session result
+
+`GET /v1/runs/{run_id}/accepted-source` requires the original authenticated
+API scope and an idempotent, durable admission. Admission-only metadata lives
+on the existing reservation row; status updates cannot replace it. The owner
+checks the original body fingerprint, run/session, principal, accepted time and
+current process epoch. An explicitly selected external plugin classifies the
+input through the profile-scoped `ctx.register_api_source_provider()` surface.
+It returns hashes/identifiers, that provider's bounded classification and the
+actual owner revision/epoch. No prompt, API key or
+idempotency key is returned. Room grants, caller history, rich/list input,
+forwarded Bot Chat ownership, cancelled/foreign/malformed records and unknown
+intents remain unavailable. A ContextVar or copied hook JSON is unnecessary.
+
+This readback is **not proof of OS isolation**. A model with the owner's UID can
+write a 0600 registry or mutable source. A protected consumer must independently
+qualify immutable source, registry/process integrity and the authenticated route
+before granting this owner source-attestation authority.
+
+`POST /v1/runs/{run_id}/source-result` accepts only `{}` under that original
+scope. It never accepts answer text, proof, a destination or a request UUID.
+The opt-in `platforms.api_server.extra.accepted_source_provider` selects a
+registered provider by name. Classification, external transport, credentials,
+business policy and attributed presentation live in that standalone integration,
+not the API core. Missing or unloaded providers fail closed. The core invokes
+the external `read_result(source)` under a 3.5-second budget and checks the exact
+current admission/provider again afterwards. No executable, destination, host or
+provider backend is embedded in the core or supplied by HTTP/model arguments.
+
+Queued is not delivered. An answered result uses the existing detached-delivery
+transaction and stable result identity to append an attributed assistant row.
+First validation is retained in the existing reservation before a busy turn can
+defer the transcript write. New results must have an authenticated producer's
+first validation within five minutes of authorship. Exact known pending or
+persisted identities are checked before applying new-result freshness; busy
+sessions and old exact retries do not lose a previously validated result.
+Providers must still independently verify immutable proof/source and current
+authority on EVERY read, including after answer age-out. Changed content/source
+metadata fails closed. Exact retries, including compression lineage, reuse the row.
+The owner reads the persisted row back before returning `state: persisted` and
+its message ID. This proves transcript persistence, not phone display or APNs
+delivery. The external integration owns its existing wake/reconciliation entry
+point; this API installs no poller, daemon, store or new model tool.
+
 ### GET /v1/runs/\{run_id\}/events
 
 Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.

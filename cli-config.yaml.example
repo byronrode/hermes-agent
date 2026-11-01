@@ -1099,6 +1099,16 @@ group_sessions_per_user: true
 # can discover them without manual coordination.  Caller authentication is
 # unchanged: every request still authenticates with the global API server
 # key (``extra.key`` / API_SERVER_KEY).
+#
+# Optional accepted-source/result integration, supplied by a separately installed
+# and enabled external plugin via ctx.register_api_source_provider(). No transport
+# executable, company credentials or product host is configured in the core:
+# platforms:
+#   api_server:
+#     extra:
+#       accepted_source_provider: example-owner
+# Configuration alone does not isolate the source owner/registry from model
+# tools or grant external authority. See the Runs API source contract.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gateway Streaming

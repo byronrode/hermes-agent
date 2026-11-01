@@ -1,0 +1,160 @@
+"""Generic HTTP admission, external owner and durable detached-delivery contracts."""
+import asyncio
+import copy
+from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+import pytest
+import pytest_asyncio
+
+from gateway.config import PlatformConfig
+from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+from hermes_state import SessionDB
+
+
+@pytest_asyncio.fixture
+async def owner(tmp_path):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={'key':'synthetic-api-key',
+        'accepted_source_provider':'external-source'}))
+    adapter._run_idempotency_store.close()
+    adapter._run_idempotency_store = RunIdempotencyStore(str(tmp_path / 'runs.db'))
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    db.create_session('original-session', source='api_server')
+    db.append_message('original-session', 'user', 'source request')
+    adapter._session_db = db
+    provider = SimpleNamespace(name='external-source', result=None)
+    def qualify(*, message, profile):
+        if message == 'invalid-classification':
+            return {'owner_pid':'copied-model-claim'}
+        if message == 'broken-classification':
+            raise RuntimeError('optional external classifier unavailable')
+        if profile == 'default' and message in {'first status','second status'}:
+            return {'intent':'synthetic_status','subject':message.split()[0]}
+    async def read_result(source):
+        return copy.deepcopy(provider.result)
+    provider.qualify, provider.read_result = qualify, read_result
+    manager = PluginManager(scope_key=str(tmp_path))
+    manager._discovered = True
+    registration = PluginContext(PluginManifest(name='external-integration'), manager).register_api_source_provider(provider)
+    agent = MagicMock()
+    agent._persist_disabled = False
+    agent.session_id, agent.platform, agent.model = 'original-session','api_server','synthetic-model'
+    agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+    finished = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    def conversation(**kwargs):
+        loop.call_soon_threadsafe(finished.set)
+        return {'final_response':'synthetic completion'}
+    agent.run_conversation.side_effect = conversation
+    app = web.Application()
+    app.router.add_post('/v1/runs',adapter._handle_runs)
+    app.router.add_get('/v1/runs/{run_id}/accepted-source',adapter._handle_run_source_receipt)
+    app.router.add_post('/v1/runs/{run_id}/source-result',adapter._handle_run_source_result)
+    with patch.object(adapter,'_create_agent',return_value=agent), patch('hermes_cli.plugins.get_plugin_manager',return_value=manager):
+        yield adapter,app,db,finished,provider,registration
+        await asyncio.gather(*adapter._active_run_tasks.values(),return_exceptions=True)
+    registration.dispose()
+    adapter._run_idempotency_store.close();adapter._response_store.close();db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('message,forwarded', [('first status',False),('second status',False),
+    ('ambiguous status',False),('invalid-classification',False),('broken-classification',False),
+    ([{'role':'user','content':'first status'}],False),('first status',True)])
+async def test_http_admission_is_current_scoped_source_with_external_classification(owner,message,forwarded,monkeypatch):
+    adapter,app,db,finished,provider,registration = owner
+    headers = {'Authorization':'Bearer synthetic-api-key','Idempotency-Key':'request'}
+    body = {'session_id':'original-session','input':message}
+    if forwarded:
+        monkeypatch.setattr(adapter,'_admit_to_live_bot_chat',AsyncMock(return_value=('synthetic',{'delivery_id':'actual-owner'})))
+        monkeypatch.setattr('gateway.platforms.api_server_runs._execute_run_via_live_owner',AsyncMock())
+    async with TestClient(TestServer(app)) as cli:
+        assert (await cli.post('/v1/runs',json=body)).status == 401
+        accepted = await cli.post('/v1/runs',json=body,headers=headers)
+        assert accepted.status == 202
+        run = (await accepted.json())['run_id']
+        if not forwarded: await asyncio.wait_for(finished.wait(),5)
+        assert (await (await cli.post('/v1/runs',json=body,headers=headers)).json())['run_id'] == run
+        path = f'/v1/runs/{run}/accepted-source'
+        assert (await cli.get(path)).status == 401
+        response = await cli.get(path,headers=headers)
+        if forwarded or message not in ('first status','second status'):
+            assert response.status == 404
+            return
+        assert response.status == 200
+        source = await response.json()
+        assert source['provider'] == 'external-source' and source['subject'] == message.split()[0]
+        assert source['run_id'] == run and source['session_id'] == 'original-session'
+        assert len(source['body_fingerprint']) == 64
+        status = adapter._run_idempotency_store.status_for_run(source['auth_scope'],run)['status']
+        for changed in ({'session_id':'foreign'}, {'status':'cancelled'}, {'delivery_id':'forwarded'}):
+            adapter._run_idempotency_store.update_status(run,{**status,**changed})
+            assert (await cli.get(path,headers=headers)).status == 404
+        adapter._run_idempotency_store.update_status(run,status)
+        assert (await cli.get(path,headers=headers)).status == 200
+        registration.dispose()
+        assert (await cli.get(path,headers=headers)).status == 404
+
+
+@pytest.mark.asyncio
+async def test_first_validated_result_survives_busy_ageout_exact_retry_and_compression(owner):
+    adapter,app,db,finished,provider,registration = owner
+    headers = {'Authorization':'Bearer synthetic-api-key','Idempotency-Key':'request'}
+    async with TestClient(TestServer(app)) as cli:
+        admitted = await cli.post('/v1/runs',json={'session_id':'original-session','input':'first status'},headers=headers)
+        assert admitted.status == 202
+        run = (await admitted.json())['run_id']
+        await asyncio.wait_for(finished.wait(),5)
+        source = await (await cli.get(f'/v1/runs/{run}/accepted-source',headers=headers)).json()
+        path = f'/v1/runs/{run}/source-result'
+        assert (await cli.post(path,json={})).status == 401
+        assert (await cli.post(path,json={'answer':'forged','session_id':'foreign'},headers=headers)).status == 503
+        provider.result = {'state':'queued','accepted_source':source}
+        assert (await (await cli.post(path,json={},headers=headers)).json())['state'] == 'queued'
+        authored = datetime.now(timezone.utc)
+        result = {'state':'answered','accepted_source':source,'identity':'external:immutable-result',
+            'content':'Attributed external answer','display_kind':'external_result',
+            'metadata':{'delegation_id':'external:immutable-result','source_run_id':run,'source_reference':'immutable:revision'},
+            'authored_at':authored.isoformat(),'validated_at':authored.isoformat()}
+        # An old first acceptance is refused, even through a registered producer.
+        provider.result = {**result,'validated_at':(authored+timedelta(minutes=6)).isoformat()}
+        class Later(datetime):
+            @classmethod
+            def now(cls,tz=None): return authored+timedelta(minutes=7)
+        with patch('gateway.platforms.api_server_source_receipts.datetime',Later):
+            assert (await cli.post(path,json={},headers=headers)).status == 503
+        assert adapter._run_idempotency_store.source_result_for_run(source['auth_scope'],run) is None
+        provider.result = result
+        assert db.acquire_session_turn_lease('original-session','busy-client',ttl_seconds=3600,wait_seconds=0)
+        try:
+            assert (await cli.post(path,json={},headers=headers)).status == 503
+            assert adapter._run_idempotency_store.source_result_for_run(source['auth_scope'],run) == result
+            with patch('gateway.platforms.api_server_source_receipts.datetime',Later):
+                assert (await cli.post(path,json={},headers=headers)).status == 503
+        finally:
+            db.release_session_turn_lease('original-session','busy-client')
+        with patch('gateway.platforms.api_server_source_receipts.datetime',Later):
+            first = await cli.post(path,json={},headers=headers)
+            assert first.status == 200, await first.text()
+            persisted = await first.json()
+            retry = await cli.post(path,json={},headers=headers)
+            assert (await retry.json())['message_id'] == persisted['message_id']
+            provider.result = {**result,'content':'substituted under same identity'}
+            assert (await cli.post(path,json={},headers=headers)).status == 503
+            provider.result = result
+            db.end_session('original-session','compression')
+            db.create_session('continued-session',source='api_server',parent_session_id='original-session')
+            replay = await cli.post(path,json={},headers=headers)
+            assert replay.status == 200, await replay.text()
+            assert (await replay.json())['message_id'] == persisted['message_id']
+            assert db.get_messages('continued-session') == []
+            adapter._run_owners[run] = 'revoked-principal'
+            assert (await cli.post(path,json={},headers=headers)).status == 503
+        rows = [m for m in db.get_messages('original-session') if m.get('display_kind')=='external_result']
+        assert len(rows)==1 and rows[0]['role']=='assistant'
+        assert rows[0]['content']=='Attributed external answer'

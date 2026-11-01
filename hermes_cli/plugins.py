@@ -762,6 +762,23 @@ class PluginContext:
                      getattr(provider, "name", "?"))
 
     @_serialized_replacement
+    def register_api_source_provider(self, provider) -> PluginRegistration:
+        """Register a profile-local accepted-source classifier/result consumer.
+
+        Providers hold their external transport and policy. The API owns actual
+        admission identity, current authority checks and detached persistence.
+        Registration is inert unless selected by the API owner's configuration.
+        """
+        name = getattr(provider, 'name', None)
+        if (not isinstance(name, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,79}', name)
+                or not callable(getattr(provider, 'qualify', None))
+                or not callable(getattr(provider, 'read_result', None))):
+            raise self._refuse('an invalid API source provider')
+        return self._register_entry('api_source_provider', name,
+            self._manager._api_source_providers, provider,
+            "Plugin '%s' registered API source provider: %s", name)
+
+    @_serialized_replacement
     def register_dashboard_auth_provider(self, provider) -> Optional[PluginRegistration]:
         """Register a :class:`hermes_cli.dashboard_auth.DashboardAuthProvider` for the dashboard
         auth gate (non-loopback bind without ``--insecure``). Wrong type / duplicate name warn and
@@ -1215,6 +1232,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._portable_mcp_server_plugins: Dict[str, str] = {}
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
         self._approval_transports: Dict[str, Any] = {}
+        self._api_source_providers: Dict[str, Any] = {}
         self._slack_action_handlers: List[tuple] = []
         self._platform_handler_factories: Dict[str, List[tuple]] = {}
         # Process-owned discovery listeners (``on_plugin_loaded``); never cleared by unload().

@@ -212,6 +212,8 @@ def _initialize_run_state(self, *, store_factory) -> None:
     """Initialize adapter-owned durable and live ``/v1/runs`` state."""
     self._run_idempotency_store = store_factory()
     self._run_owner_pid = os.getpid()
+    from hermes_cli.version_info import get_code_identity
+    self._run_owner_revision = get_code_identity().get('sha')
     try:
         from gateway.status import get_process_start_time
         self._run_owner_started = int(get_process_start_time(self._run_owner_pid) or 0)
@@ -274,7 +276,7 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
         status != previous_status
         or status in TERMINAL_STATUSES
         or bool(field_names & {
-            "output", "error", "usage", "pending_steer", "session_id", "shutdown_requested_at"}))
+            "output", "error", "usage", "pending_steer", "session_id", "shutdown_requested_at", "delivery_id"}))
     if run_id in self._run_idempotency_ids and should_persist:
         try:
             self._run_idempotency_store.update_status(run_id, current)
@@ -719,10 +721,17 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     initial_status = self._set_run_status(
         run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
     if idempotency_key:
+        from gateway.platforms.api_server_source_receipts import admission_source, source_provider
+        from hermes_cli.profiles import get_active_profile_name
+        source_receipt = admission_source(message=raw_input,
+            authenticated=bool(self._expected_api_key()) and not bool(self._room_grant_token(request)),
+            profile=get_active_profile_name(), run_id=run_id, session_id=session_id,
+            scope=idempotency_scope, fingerprint=idempotency_fingerprint, created_at=created_at,
+            history_delivery=session_history_delivery, provider=source_provider(self))
         outcome, record = self._run_idempotency_store.reserve(
             idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
             owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
-            retention_until=_room_retention_until(request))
+            retention_until=_room_retention_until(request), accepted_source=source_receipt)
         if outcome != "created":
             _forget_run(
                 self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
@@ -753,6 +762,9 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
     admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
     if admitted is not None:
+        # Publish the actual forwarded owner before returning HTTP202. Waiting
+        # for its background task leaves a source-readback race at admission.
+        self._set_run_status(run_id, "queued", delivery_id=admitted[1]["delivery_id"])
         task = self._active_run_tasks[run_id] = asyncio.create_task(
             _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
     else:

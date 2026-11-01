@@ -16,6 +16,7 @@ real code paths unchanged.
 from __future__ import annotations
 
 from pathlib import Path
+import pytest
 
 import hermes_cli.main as main_mod
 from hermes_cli import _early_recovery as er
@@ -40,6 +41,16 @@ class TestPredicate:
 
 
 class TestEarlyRecovery:
+    @pytest.mark.parametrize('explicit_root', [True, False])
+    def test_interrupted_pull_skips_live_checkout_before_marker_resolution(self, monkeypatch, explicit_root):
+        def forbidden_marker(*_args):
+            raise AssertionError('interrupted-pull marker resolved against live checkout')
+
+        monkeypatch.setattr(er, 'interrupted_pull_marker', forbidden_marker)
+        monkeypatch.setattr(er, '_project_root', lambda: CHECKOUT_ROOT)
+        args = {'project_root': CHECKOUT_ROOT} if explicit_root else {}
+        assert er.restore_interrupted_pull(**args) is False
+
     def test_skips_live_checkout_before_any_probe_or_lock(self, monkeypatch):
         # A probe call would mean recovery is proceeding against the live
         # checkout; the guard must return before ANY side-effectful step.

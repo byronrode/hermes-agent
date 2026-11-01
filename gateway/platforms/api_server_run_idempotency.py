@@ -30,6 +30,7 @@ _EXTEND_RETENTION_BY_RUN = (
 # Columns added after the first schema shipped; applied when missing.
 _MIGRATIONS = {
     "accepted_source_json": "TEXT",
+    "source_result_json": "TEXT",
     "owner_pid": "INTEGER NOT NULL DEFAULT 0",
     "owner_started": "INTEGER NOT NULL DEFAULT 0",
     "retention_until": "REAL NOT NULL DEFAULT 0",
@@ -240,3 +241,24 @@ class RunIdempotencyStore:
             return None
         return {"source": json.loads(row[0]), "fingerprint": row[1], "status": json.loads(row[2]),
                 "owner_pid": row[3], "owner_started": row[4]}
+
+    def source_result_for_run(self, scope: str, run_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute('SELECT source_result_json FROM run_idempotency WHERE scope=? AND run_id=?',
+                                     (scope, run_id)).fetchone()
+        return json.loads(row[0]) if row and row[0] else None
+
+    def remember_source_result(self, scope: str, run_id: str, source: dict, result: dict) -> None:
+        """First validated result shares the accepted reservation, before a busy transcript defers it."""
+        with self._immediate_txn():
+            row = self._conn.execute('SELECT accepted_source_json, source_result_json FROM run_idempotency '
+                                     'WHERE scope=? AND run_id=?', (scope, run_id)).fetchone()
+            original = {k:v for k,v in source.items() if k not in {'owner_pid','owner_started','owner_revision'}}
+            if not row or not row[0] or json.loads(row[0]) != original:
+                raise ValueError('Accepted source changed before pending result')
+            if row[1] and json.loads(row[1]) != result:
+                raise ValueError('Source result identity already binds another result')
+            if not row[1]:
+                self._conn.execute('UPDATE run_idempotency SET source_result_json=? WHERE scope=? AND run_id=?',
+                                   (_encode_status(result), scope, run_id))
+            self._conn.commit()

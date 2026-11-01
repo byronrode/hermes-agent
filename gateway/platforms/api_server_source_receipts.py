@@ -1,48 +1,56 @@
-"""Bounded admission readback and detached result lifecycle, never model provenance.
+"""Generic accepted-source readback and detached delivery lifecycle.
 
-OS protection of this owner, its code and registry is a deployment prerequisite.
-The endpoint does not certify that protection and holds no company attester key.
+Classification and protected transport belong to an external, profile-scoped
+plugin. This owner supplies only admission integrity and delivery primitives.
+OS protection of the owner, source and registry remains a deployment prerequisite.
 """
 import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
-from pathlib import Path
 import re
 import sqlite3
-import uuid
 
 from aiohttp import web
 
 
-def status_role(message):
-    if not isinstance(message, str):
+_FAILURES = (ValueError, KeyError, TypeError, OSError, RuntimeError, TimeoutError, sqlite3.Error, OverflowError)
+
+
+def source_provider(owner):
+    name = owner.config.extra.get('accepted_source_provider')
+    if not isinstance(name, str) or not name:
         return None
-    message = re.sub(r'^\[Mara (?:message|voice note): [0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\]\n', '', message)
-    if not 0 < len(message) <= 300:
-        return None
-    role = r'(cto|cpo|ciso|support|head of customer success)'
-    patterns = (r'(?:ignis\s+)?' + role + r'\s+status',
-                r'ask (?:the )?' + role + r' for (?:a |the |current )?status',
-                r'(?:mara,? )?get (?:a |the |current )?status from (?:the )?' + role,
-                r'what(?:\'s| is) (?:the )?(?:current )?status (?:of|from) (?:the )?' + role)
-    for pattern in patterns:
-        match = re.fullmatch(pattern + r'[?.!]?', message.strip(), re.I)
-        if match:
-            return 'support' if match[1].lower() == 'head of customer success' else match[1].lower()
-    return None
+    from hermes_cli.plugins import get_plugin_manager
+    manager = get_plugin_manager()
+    if not manager._discovered:
+        manager.discover_and_load()
+    return manager._api_source_providers.get(name)
 
 
 def admission_source(*, message, authenticated, profile, run_id, session_id, scope,
-                     fingerprint, created_at, history_delivery):
-    role = status_role(message)
-    if not authenticated or not role or profile != 'default' or not history_delivery or not fingerprint:
+                     fingerprint, created_at, history_delivery, provider=None):
+    if not authenticated or not isinstance(message, str) or not history_delivery or not fingerprint or provider is None:
         return None
-    return {'version': 1, 'intent': 'role_status', 'role': role, 'run_id': run_id,
-            'session_id': session_id, 'profile': profile, 'auth_scope': scope,
-            'message_sha256': hashlib.sha256(message.encode()).hexdigest(),
-            'body_fingerprint': fingerprint,
-            'accepted_at': datetime.fromtimestamp(created_at, timezone.utc).isoformat()}
+    try:
+        attributes = provider.qualify(message=message, profile=profile)
+    except Exception:
+        # A broken optional classifier removes source authority, not unrelated
+        # ordinary intake. No private input or plugin exception is logged here.
+        return None
+    if not isinstance(attributes, dict) or not attributes:
+        return None
+    source = {'version': 1, 'provider': provider.name, 'run_id': run_id,
+              'session_id': session_id, 'profile': profile, 'auth_scope': scope,
+              'message_sha256': hashlib.sha256(message.encode()).hexdigest(),
+              'body_fingerprint': fingerprint,
+              'accepted_at': datetime.fromtimestamp(created_at, timezone.utc).isoformat()}
+    if ((set(source) | {'owner_pid','owner_started','owner_revision'}) & set(attributes)
+            or not all(isinstance(k, str) and isinstance(v, str) and len(v) <= 128 for k,v in attributes.items())):
+        return None
+    if len(json.dumps(attributes)) > 2048:
+        return None
+    return {**source, **attributes}
 
 
 def read_source(owner, scope, run_id):
@@ -53,9 +61,12 @@ def read_source(owner, scope, run_id):
     if not record:
         raise ValueError('source_not_qualified')
     source, status = record['source'], record['status']
+    provider = source_provider(owner)
+    from hermes_cli.profiles import get_active_profile_name
     current = owner._run_statuses.get(run_id) or {}
     accepted = datetime.fromisoformat(source['accepted_at'])
-    if (source['run_id'] != run_id or source['auth_scope'] != scope
+    if (provider is None or provider.name != source['provider'] or source['profile'] != get_active_profile_name()
+            or source['run_id'] != run_id or source['auth_scope'] != scope
             or source['body_fingerprint'] != record['fingerprint']
             or status.get('run_id') != run_id or status.get('session_id') != source['session_id']
             or status.get('status') not in {'queued', 'running', 'completed', 'waiting_for_approval'}
@@ -65,20 +76,17 @@ def read_source(owner, scope, run_id):
             or current.get('status') not in {'queued', 'running', 'completed', 'waiting_for_approval'}
             or current.get('delivery_id')
             or (record['owner_pid'], record['owner_started']) != (owner._run_owner_pid, owner._run_owner_started)
-            or not 0 <= (datetime.now(timezone.utc) - accepted).total_seconds() <= 86400):
+            or not 0 <= (datetime.now(timezone.utc) - accepted).total_seconds() <= store.RETENTION_SECONDS):
         raise ValueError('source_owner_changed')
     return {**source, 'owner_pid': record['owner_pid'], 'owner_started': record['owner_started'],
             'owner_revision': owner._run_owner_revision}
 
 
 def _authorized(owner, request):
-    # Room grants and an unkeyed test listener never acquire source authority.
     error = owner._check_auth(request)
     if error is not None:
         return error
-    from gateway.platforms.api_server import _api_request_profile
-    if (_api_request_profile.get() not in (None, 'default')
-            or not owner._expected_api_key() or owner._room_grant_token(request)):
+    if not owner._expected_api_key() or owner._room_grant_token(request):
         return web.json_response({'error': 'source_auth_required'}, status=403)
     return None
 
@@ -89,9 +97,24 @@ async def handle_source(owner, request):
         return error
     try:
         source = read_source(owner, owner._run_idempotency_scope(request), request.match_info['run_id'])
-    except (ValueError, KeyError, TypeError, OSError, sqlite3.Error, OverflowError):
+    except _FAILURES:
         return web.json_response({'error': 'source_unavailable'}, status=404)
     return web.json_response(source)
+
+
+def _delivery(result, source):
+    if not isinstance(result, dict) or result.get('accepted_source') != source:
+        raise ValueError('source_binding_mismatch')
+    if result.get('state') != 'answered':
+        return None
+    metadata = result.get('metadata')
+    if (not isinstance(result.get('content'), str) or not 0 < len(result['content'].strip()) <= 7000
+            or not re.fullmatch(r'[A-Za-z0-9_.:@+/-]{1,239}', str(result.get('identity', '')))
+            or not re.fullmatch(r'[a-z][a-z0-9_]{0,79}', str(result.get('display_kind', '')))
+            or not isinstance(metadata, dict) or metadata.get('delegation_id') != result['identity']
+            or metadata.get('source_run_id') != source['run_id'] or len(json.dumps(result)) > 65536):
+        raise ValueError('malformed_source_result')
+    return result
 
 
 async def handle_result(owner, request):
@@ -101,70 +124,45 @@ async def handle_result(owner, request):
     try:
         if await request.json() != {}:
             raise ValueError('no_result_or_destination_arguments')
-        source = read_source(owner, owner._run_idempotency_scope(request), request.match_info['run_id'])
-        # Fixed installation-owned command; no shell, payload-selected executable,
-        # environment credential or raw prompt. The protected host independently
-        # reads this admission and native proof, rather than trusting this JSON.
-        transport = owner.config.extra.get('source_result_transport')
-        if transport != {'host': 'ignis-one'}:
-            return web.json_response({'state': 'unavailable'}, status=503)
-        home = Path.home()
-        command = [str(home / '.local/share/mara-host-agent/current'),
-                   '-config', str(home / '.config/mara-host-agent/config.json'),
-                   '-send-action', 'role-status-source', '-target', 'ignis-one']
-        process = await asyncio.create_subprocess_exec(*command, stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            env={'PATH': '/usr/bin:/bin', 'HOME': str(home)})
-        try:
-            stdout, _ = await asyncio.wait_for(process.communicate(json.dumps(
-                {'run_id': source['run_id'], 'phase': 'read'}).encode()), timeout=3.5)
-        except (TimeoutError, asyncio.CancelledError):
-            process.kill()
-            await process.wait()
-            raise
-        if process.returncode or len(stdout) > 65536:
-            raise ValueError('protected_result_unavailable')
-        result = json.loads(stdout)
-        # Re-read after I/O: cancellation/revocation/session substitution cannot
-        # publish into a now-changed run. Caller-supplied JSON is never accepted.
-        if source != read_source(owner, owner._run_idempotency_scope(request), source['run_id']):
+        scope, run_id = owner._run_idempotency_scope(request), request.match_info['run_id']
+        source = read_source(owner, scope, run_id)
+        provider = source_provider(owner)
+        # The registered external owner must revalidate current authority and
+        # immutable proof even for a previously validated/persisted result.
+        result = await asyncio.wait_for(provider.read_result(source), timeout=3.5)
+        if source_provider(owner) is not provider or source != read_source(owner, scope, run_id):
             raise ValueError('source_changed')
-        if result.get('accepted_source') != source:
-            raise ValueError('source_binding_mismatch')
-        if result.get('state') != 'answered':
-            return web.json_response({'state': result.get('state') if result.get('state') in {'queued', 'unavailable'} else 'unavailable'})
-        answer = result['answer']
-        if (not isinstance(answer, dict) or not isinstance(answer.get('text'), str)
-                or not 0 < len(answer['text'].strip()) <= 6000
-                or not re.fullmatch(r'document:[0-9a-f-]{36}:[0-9a-f-]{36}', result.get('source_reference', ''))
-                or not re.fullmatch(r'[0-9a-f-]{36}', result.get('request_id', ''))
-                or not re.fullmatch(r'run:[0-9a-f-]{36}', answer.get('source_reference', ''))):
-            raise ValueError('malformed_result')
-        for identity in (result['request_id'], answer['agent_id'], answer['source_reference'][4:]):
-            if str(uuid.UUID(identity)) != identity:
-                raise ValueError('malformed_result_identity')
-        authored = datetime.fromisoformat(answer['updated_at'].replace('Z', '+00:00'))
-        if (not 0 <= (datetime.now(timezone.utc) - authored).total_seconds() <= 300
-                or authored < datetime.fromisoformat(source['accepted_at'])):
-            raise ValueError('stale_result')
+        delivery = _delivery(result, source)
+        if delivery is None:
+            return web.json_response({'state': result.get('state') if result.get('state') in {'queued','unavailable'} else 'unavailable'})
         db = await owner._ensure_session_db_async()
-        # Existing detached delivery writer owns locking, lineage and idempotency.
-        metadata = {'delegation_id': 'role-status:' + result['request_id'],
-                    'source_run_id': source['run_id'], 'source_reference': result['source_reference'],
-                    'role': source['role'], 'agent_id': answer['agent_id'],
-                    'answer_source_reference': answer['source_reference'], 'authored_at': answer['updated_at']}
-        session = await asyncio.to_thread(db.resolve_resume_session_id, source['session_id'])
-        session = session or source['session_id']
-        row = await asyncio.to_thread(db.append_role_result_delivery, session,
-                                     source['role'].upper() + ': ' + answer['text'], metadata)
-        lineage = await asyncio.to_thread(db._resume_lineage_ids, session)
-        messages = []
-        for identity in lineage:
-            messages.extend(await asyncio.to_thread(db.get_messages, identity, include_compacted=True))
-        if not any(m['id'] == row and m['role'] == 'assistant' and m.get('display_kind') == 'role_status_result'
-                   and m.get('display_metadata') == metadata for m in messages):
+        session = await asyncio.to_thread(db.resolve_resume_session_id, source['session_id']) or source['session_id']
+        # Check durable identity BEFORE applying a new-result age limit. Both the
+        # reservation's pending slot and the existing transcript survive retries.
+        pending = owner._run_idempotency_store.source_result_for_run(scope, run_id)
+        existing = await asyncio.to_thread(db.get_source_result_delivery, session, delivery['identity'], delivery['display_kind'])
+        if pending is not None and pending != delivery:
+            raise ValueError('source_result_identity_changed')
+        if existing is not None and (existing['content'] != delivery['content'] or existing['metadata'] != delivery['metadata']):
+            raise ValueError('persisted_source_result_changed')
+        if pending is None and existing is None:
+            authored = datetime.fromisoformat(delivery['authored_at'].replace('Z','+00:00'))
+            validated = datetime.fromisoformat(delivery['validated_at'].replace('Z','+00:00'))
+            # A protected producer may have first validated before this owner
+            # received it. This timestamp is not accepted from HTTP/model JSON.
+            if (not 0 <= (validated-authored).total_seconds() <= 300
+                    or validated > datetime.now(timezone.utc)
+                    or authored < datetime.fromisoformat(source['accepted_at'])):
+                raise ValueError('stale_first_source_result')
+        # Persist first validation before the transcript lease can defer writing.
+        owner._run_idempotency_store.remember_source_result(scope, run_id, source, delivery)
+        if source != read_source(owner, scope, run_id):
+            raise ValueError('source_changed_before_delivery')
+        row = await asyncio.to_thread(db.append_source_result_delivery, session,
+            delivery['content'], delivery['metadata'], display_kind=delivery['display_kind'])
+        persisted = await asyncio.to_thread(db.get_source_result_delivery, session, delivery['identity'], delivery['display_kind'])
+        if persisted is None or persisted['id'] != row or persisted['content'] != delivery['content'] or persisted['metadata'] != delivery['metadata']:
             raise ValueError('delivery_readback_failed')
-        return web.json_response({'state': 'persisted', 'run_id': source['run_id'],
-                                  'session_id': source['session_id'], 'message_id': row})
-    except (ValueError, KeyError, TypeError, OSError, RuntimeError, TimeoutError, sqlite3.Error, OverflowError):
-        return web.json_response({'state': 'unavailable'}, status=503)
+        return web.json_response({'state':'persisted','run_id':run_id,'session_id':source['session_id'],'message_id':row})
+    except _FAILURES:
+        return web.json_response({'state':'unavailable'}, status=503)

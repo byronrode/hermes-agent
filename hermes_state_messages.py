@@ -66,6 +66,14 @@ _SHADOWED_CHECKPOINT_ROWS_SQL = ("SELECT id, codex_reasoning_items FROM messages
 _SET_CODEX_REASONING_SQL = "UPDATE messages SET codex_reasoning_items = ? WHERE id = ?"
 _INVALID = object()  # _json_or sentinel where the fallback must be distinguishable from JSON null
 
+_DETACHED_DELIVERY_SQL = """WITH RECURSIVE lineage(id) AS (
+    SELECT ? UNION SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id=l.id
+    JOIN sessions p ON p.id=s.parent_session_id WHERE p.end_reason='compression'
+) SELECT m.id,m.role,m.content,m.display_metadata,m.display_kind FROM messages m JOIN lineage l ON m.session_id=l.id
+WHERE (m.display_kind IN ('async_delegation_complete','hidden') OR m.display_kind=?)
+AND json_extract(m.display_metadata,'$.delegation_id')=?
+AND coalesce(json_extract(m.display_metadata,'$.delivery_notice'),'')=? LIMIT 1"""
+
 
 def _json_or(raw: Any, fallback: Any, warning: str) -> Any:
     """``json.loads(raw)``; on failure log *warning* and return *fallback*."""
@@ -336,11 +344,20 @@ class SessionMessagesMixin:
         return self._append_detached_delivery(session_id, content, metadata, "user",
             "hidden" if metadata.get("presentation_suppressed") else "async_delegation_complete")
 
-    def append_role_result_delivery(self, session_id: str, content: str, metadata: Dict[str, Any]) -> int:
-        """An attributed source result is an assistant presentation, never a new user turn."""
-        if metadata.get('role') not in {'cto', 'cpo', 'ciso', 'support'} or not metadata.get('source_reference'):
-            raise ValueError('Role result requires attributed source metadata')
-        return self._append_detached_delivery(session_id, content, metadata, 'assistant', 'role_status_result')
+    def append_source_result_delivery(self, session_id: str, content: str, metadata: Dict[str, Any], *,
+                                     display_kind: str = 'source_result') -> int:
+        """A source owner's attributed presentation never starts a user/model turn."""
+        if not re.fullmatch(r'[a-z][a-z0-9_]{0,79}', display_kind) or display_kind in {'hidden','async_delegation_complete'}:
+            raise ValueError('Source result requires its own display kind')
+        return self._append_detached_delivery(session_id, content, metadata, 'assistant', display_kind)
+
+    def get_source_result_delivery(self, session_id: str, identity: str, display_kind: str):
+        row = self._read_one(_DETACHED_DELIVERY_SQL, (session_id, display_kind, identity, ''))
+        if row is None:
+            return None
+        if row[1] != 'assistant' or row[4] != display_kind:
+            raise ValueError('Source delivery identity already binds another presentation')
+        return {'id':row[0], 'content':self._decode_content(row[2]), 'metadata':json.loads(row[3])}
 
     def _append_detached_delivery(self, session_id, content, metadata, role, kind):
         delegation_id = metadata.get("delegation_id")
@@ -352,18 +369,10 @@ class SessionMessagesMixin:
         params = self._message_row_params(session_id, role, msg, None, time.time(), keep_reasoning=True)
 
         def _do(conn):
-            existing = conn.execute(
-                """WITH RECURSIVE lineage(id) AS (
-                    SELECT ? UNION
-                    SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id = l.id
-                    JOIN sessions p ON p.id = s.parent_session_id WHERE p.end_reason = 'compression'
-                ) SELECT m.id, m.role, m.content, m.display_metadata, m.display_kind FROM messages m JOIN lineage l ON m.session_id = l.id
-                WHERE m.display_kind IN ('async_delegation_complete', 'hidden', 'role_status_result')
-                AND json_extract(m.display_metadata, '$.delegation_id') = ?
-                AND coalesce(json_extract(m.display_metadata, '$.delivery_notice'), '') = ? LIMIT 1""",
-                (session_id, delegation_id, metadata.get("delivery_notice", ""))).fetchone()
+            existing = conn.execute(_DETACHED_DELIVERY_SQL,
+                (session_id, kind, delegation_id, metadata.get("delivery_notice", ""))).fetchone()
             if existing is not None:
-                if kind == 'role_status_result' and (existing[1] != role or existing[4] != kind
+                if role == 'assistant' and (existing[1] != role or existing[4] != kind
                         or self._decode_content(existing[2]) != content
                         or json.loads(existing[3]) != metadata):
                     raise ValueError('Detached role result identity already binds another result')

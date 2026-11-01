@@ -721,13 +721,13 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     initial_status = self._set_run_status(
         run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
     if idempotency_key:
-        from gateway.platforms.api_server_source_receipts import admission_source
+        from gateway.platforms.api_server_source_receipts import admission_source, source_provider
         from hermes_cli.profiles import get_active_profile_name
         source_receipt = admission_source(message=raw_input,
             authenticated=bool(self._expected_api_key()) and not bool(self._room_grant_token(request)),
             profile=get_active_profile_name(), run_id=run_id, session_id=session_id,
             scope=idempotency_scope, fingerprint=idempotency_fingerprint, created_at=created_at,
-            history_delivery=session_history_delivery)
+            history_delivery=session_history_delivery, provider=source_provider(self))
         outcome, record = self._run_idempotency_store.reserve(
             idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
             owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,

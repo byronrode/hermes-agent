@@ -631,6 +631,34 @@ def register(ctx):
 
 The dispatched tool goes through the normal approval, redaction, and budget pipelines — it's a real tool invocation, not a shortcut around them.
 
+### Accepted API source providers
+
+`ctx.register_api_source_provider(provider)` registers a profile-local, unloadable
+integration selected explicitly by `platforms.api_server.extra.accepted_source_provider`.
+The provider has `name`, synchronous `qualify(*, message, profile)` and async
+`read_result(source)` methods. Qualification returns a bounded string-valued
+classification or None, and must not perform I/O. It cannot replace owner fields
+such as run/session/scope/input hash/body fingerprint/accepted time. Classification
+errors remove source authority while preserving ordinary intake. No raw private
+prompt belongs in the projection or company transport.
+
+The external integration owns transport, credentials, business intent and result
+presentation. `read_result` must independently verify current permission and
+immutable source/proof on every invocation, including exact retries; a previous
+receipt alone is not authority. It returns `state`, `accepted_source`, and, for an
+answered result, stable `identity`, `content`, `display_kind`, `metadata`,
+`authored_at` and `validated_at` (the protected producer's FIRST validation time).
+Metadata binds `delegation_id` to identity and `source_run_id` to the admission.
+The first validation must be no earlier than authorship and at most five minutes
+later. The API retains that result on its existing reservation before attempting
+the lease-protected transcript write; exact pending/persisted retries preserve it
+after age-out. A different result under the same identity fails closed.
+
+Registration uses the native replacement/unload ledger and owning profile's
+manager. There is no global singleton provider or model tool. Source code and
+registry protection against model writes/debug access, and any external secure
+credential composition, still require independent runtime qualification.
+
 ### Store settings and runtime state
 
 Use plugin-relative config keys for user-visible behavior. Hermes resolves them

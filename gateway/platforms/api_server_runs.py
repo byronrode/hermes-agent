@@ -745,7 +745,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     launch.accepted_source_resolver = admission_resolver(
         self, scope=idempotency_scope, key=idempotency_key, fingerprint=idempotency_fingerprint,
         run_id=run_id, session_id=session_id, profile=get_active_profile_name(),
-        message=user_message,
+        message=raw_input,
         authenticated=bool(self._expected_api_key()) and not bool(self._room_grant_token(request)))
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would

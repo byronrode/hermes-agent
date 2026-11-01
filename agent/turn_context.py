@@ -754,7 +754,7 @@ def _collect_pre_llm_call_context(
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         from gateway.platforms.api_server_accepted_source import current_accepted_run
-        accepted_api_run = current_accepted_run()
+        accepted_api_run = current_accepted_run(session_id=agent.session_id)
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,

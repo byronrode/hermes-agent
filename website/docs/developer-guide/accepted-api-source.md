@@ -10,7 +10,12 @@ The API run owner installs a context-local resolver around its synchronous
 conversation execution. `gateway.platforms.api_server_accepted_source.current_accepted_run()`
 re-reads the owner's existing durable idempotency record with the exact captured
 scope/key/fingerprint and checks run/session/owner identity. Context is reset
-even when execution fails. No new store, endpoint, tool, environment variable,
+even when execution fails, and the resolver is revoked for retained context
+copies when its owning scope exits. Delegated execution is rejected using the
+existing delegated-child context predicate; hook projection additionally binds
+the actual executing agent session. A copied child context cannot borrow the
+parent's accepted source, even after the parent exits.
+No new store, endpoint, tool, environment variable,
 adapter or background process is introduced. Model turns, replayed HTTP
 responses, caller metadata and memory author labels do not create admissions.
 

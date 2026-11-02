@@ -188,3 +188,33 @@ async def test_current_qualified_source_uses_real_http_owner_and_revokes_copies(
             assert source is None  # Authenticated admission alone is not qualification.
         assert current_accepted_source() is None
         assert context.run(current_accepted_source) is None
+
+@pytest.mark.asyncio
+async def test_registered_source_budget_covers_slow_owner_without_changing_default(owner):
+    adapter,app,db,finished,provider,registration=owner
+    provider.read_timeout_seconds=20
+    async def slow(source):
+        await asyncio.sleep(3.6)
+        return {'state':'queued','accepted_source':source}
+    provider.read_result=slow
+    headers={'Authorization':'Bearer synthetic-api-key','Idempotency-Key':'slow-source'}
+    async with TestClient(TestServer(app)) as client:
+        run=(await (await client.post('/v1/runs',json={'session_id':'original-session','input':'first status'},headers=headers)).json())['run_id']
+        await asyncio.wait_for(finished.wait(),5)
+        path=f'/v1/runs/{run}/source-result'
+        assert (await (await client.post(path,json={},headers=headers)).json())['state']=='queued'
+        del provider.read_timeout_seconds
+        assert (await (await client.post(path,json={},headers=headers)).json())['state']=='unavailable'
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('budget',[0,31,float('nan'),True,'20'])
+async def test_invalid_source_read_budget_fails_before_producer(owner,budget):
+    adapter,app,db,finished,provider,registration=owner
+    provider.read_timeout_seconds=budget
+    provider.read_result=AsyncMock(side_effect=AssertionError('invalid budget must not invoke producer'))
+    headers={'Authorization':'Bearer synthetic-api-key','Idempotency-Key':'invalid-budget'}
+    async with TestClient(TestServer(app)) as client:
+        run=(await (await client.post('/v1/runs',json={'session_id':'original-session','input':'first status'},headers=headers)).json())['run_id']
+        await asyncio.wait_for(finished.wait(),5)
+        assert (await (await client.post(f'/v1/runs/{run}/source-result',json={},headers=headers)).json())['state']=='unavailable'
+        provider.read_result.assert_not_called()

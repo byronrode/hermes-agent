@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import re
 import sqlite3
 
@@ -129,7 +130,10 @@ async def handle_result(owner, request):
         provider = source_provider(owner)
         # The registered external owner must revalidate current authority and
         # immutable proof even for a previously validated/persisted result.
-        result = await asyncio.wait_for(provider.read_result(source), timeout=3.5)
+        timeout = getattr(provider, 'read_timeout_seconds', 3.5)
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 30:
+            raise ValueError('invalid_source_read_budget')
+        result = await asyncio.wait_for(provider.read_result(source), timeout=timeout)
         if source_provider(owner) is not provider or source != read_source(owner, scope, run_id):
             raise ValueError('source_changed')
         delivery = _delivery(result, source)

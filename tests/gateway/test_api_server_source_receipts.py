@@ -158,3 +158,33 @@ async def test_first_validated_result_survives_busy_ageout_exact_retry_and_compr
         rows = [m for m in db.get_messages('original-session') if m.get('display_kind')=='external_result']
         assert len(rows)==1 and rows[0]['role']=='assistant'
         assert rows[0]['content']=='Attributed external answer'
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('message', ['first status','ambiguous status'])
+async def test_current_qualified_source_uses_real_http_owner_and_revokes_copies(owner,message):
+    from contextvars import copy_context
+    from gateway.platforms.api_server_accepted_source import current_accepted_source
+    adapter,app,db,finished,provider,registration=owner
+    seen=[]
+    agent=adapter._create_agent.return_value
+    original=agent.run_conversation.side_effect
+    def conversation(**kwargs):
+        seen.append((current_accepted_source(session_id='original-session'),copy_context()))
+        assert current_accepted_source(session_id='foreign') is None
+        return original(**kwargs)
+    agent.run_conversation.side_effect=conversation
+    async with TestClient(TestServer(app)) as client:
+        response=await client.post('/v1/runs',json={'session_id':'original-session','input':message},
+            headers={'Authorization':'Bearer synthetic-api-key','Idempotency-Key':'qualified-source'})
+        run=(await response.json())['run_id']
+        await asyncio.wait_for(finished.wait(),5)
+        task=adapter._active_run_tasks.get(run)
+        if task:await task
+        source,context=seen[0]
+        if message=='first status':
+            assert source['run_id']==run and source['provider']=='external-source'
+            assert source['owner_pid']==adapter._run_owner_pid
+        else:
+            assert source is None  # Authenticated admission alone is not qualification.
+        assert current_accepted_source() is None
+        assert context.run(current_accepted_source) is None

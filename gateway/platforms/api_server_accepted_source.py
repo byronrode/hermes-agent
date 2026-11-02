@@ -30,6 +30,12 @@ def admission_resolver(owner, *, scope, key, fingerprint, run_id, session_id,
         return {"run_id": run_id, "session_id": session_id, "profile": profile,
                 "auth_scope": scope, "message_sha256": hashlib.sha256(message.encode()).hexdigest(),
                 "accepted_at": datetime.fromtimestamp(status["created_at"], timezone.utc).isoformat()}
+    def qualified_source():
+        if resolve() is None:
+            return None
+        from gateway.platforms.api_server_source_receipts import read_source
+        return read_source(owner, scope, run_id)
+    resolve.qualified_source = qualified_source
     return resolve
 
 
@@ -40,6 +46,10 @@ def accepted_run_scope(resolve):
     active = True
     def scoped_resolve():
         return resolve() if active and resolve is not None else None
+    def qualified_source():
+        reader = getattr(resolve, 'qualified_source', None)
+        return reader() if active and callable(reader) else None
+    scoped_resolve.qualified_source = qualified_source
     token = _current.set(scoped_resolve)
     try:
         yield
@@ -59,5 +69,22 @@ def current_accepted_run(*, session_id=None):
             return None
         return accepted
     except (sqlite3.Error, OSError, ValueError, KeyError, OverflowError):
-        # An unavailable source must not disable unrelated existing intake hooks.
+        return None
+
+
+def current_accepted_source(*, session_id=None):
+    """Resolve only a currently qualified provider source, never caller IDs.
+
+    Reuses the exact authenticated read_source owner (profile, PID/epoch,
+    reservation, provider, lifetime and status checks). No keys or new store.
+    """
+    if current_accepted_run(session_id=session_id) is None:
+        return None
+    resolve = _current.get()
+    try:
+        source = resolve.qualified_source() if resolve is not None else None
+        if source is not None and session_id is not None and source['session_id'] != session_id:
+            return None
+        return source
+    except (sqlite3.Error, OSError, ValueError, KeyError, OverflowError):
         return None

@@ -110,8 +110,16 @@ async def test_same_settled_source_after_real_owner_process_exit(tmp_path,persis
         async def recover(base):
             recoveries.append(base)
             return copy.deepcopy(source)
+        retirements=[]
         async def read(actual):
             assert actual==source
+            # Actual periodic owner cleanup runs while remote producer I/O is
+            # in flight. Durable completed reservation remains unchanged.
+            import time
+            adapter._sweep_orphaned_runs_once(time.time()+max(adapter._RUN_STATUS_TTL,adapter._RUN_STREAM_TTL)+1)
+            assert run not in adapter._run_statuses and run not in adapter._run_owners
+            retirements.append(run)
+            await asyncio.sleep(0)
             return copy.deepcopy(original['delivery'])
         provider.recover_source=recover;provider.read_result=read
         headers={'Authorization':'Bearer synthetic-api-key'}
@@ -157,6 +165,26 @@ async def test_same_settled_source_after_real_owner_process_exit(tmp_path,persis
                 assert repeated==receipt and len(recoveries)==count
                 after=adapter._run_idempotency_store.accepted_source_for_run(source['auth_scope'],run)
                 assert before==after # Original PID/start/source/fingerprint/status were NOT rewritten.
+                assert len(retirements)>=2
+                # Explicit foreign ownership during producer I/O is revocation,
+                # never an invitation to rehydrate over that owner stamp.
+                async def foreign_owner(actual):
+                    adapter._run_owners[run]='foreign-scope'
+                    return copy.deepcopy(original['delivery'])
+                provider.read_result=foreign_owner
+                denied=await client.post(path+'/source-result',json={},headers=headers)
+                assert denied.status==503
+                assert (await denied.json())['diagnostic']['reason']=='source_owner_unavailable'
+                assert adapter._run_owners[run]=='foreign-scope'
+                adapter._run_owners[run]=source['auth_scope']
+                async def revoked_provider(actual):
+                    manager._api_source_providers.pop('settled-test',None)
+                    return copy.deepcopy(original['delivery'])
+                provider.read_result=revoked_provider
+                denied=await client.post(path+'/source-result',json={},headers=headers)
+                assert denied.status==503
+                manager._api_source_providers['settled-test']=provider
+
                 assert (await (await client.get(path+'/accepted-source',headers=headers)).json())==source
                 rows=[m for m in db.get_messages('original-session') if m.get('display_kind')=='fixture_result']
                 assert len(rows)==1 and rows[0]['id']==receipt['message_id']

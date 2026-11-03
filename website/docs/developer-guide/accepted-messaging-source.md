@@ -105,3 +105,42 @@ not live Discord acceptance.
 
 Focused and broader verification: 216 tests across 18 files pass through the
 PM source runner, including hook failure/event/stream regressions.
+
+## Settled API source validation after cache retirement
+
+A parent read-only/live retry reported HTTP 503 with diagnostic
+`producer_validation / ValueError / source_owner_unavailable` after a remote
+producer read. The original stored result and central receipt were preserved.
+The native HTTP/SQLite regression reproduces the mechanism: after an actual
+original owner process exits, the replacement serves its durable completed run;
+while the synthetic producer awaits, `_sweep_orphaned_runs_once` expires terminal
+status/transport, and `_release_run_owner_if_forgotten` drops the cache owner.
+Previously, post-await source validation required that transient stamp and
+rejected the otherwise qualified reservation. Both first delivery and repeat of
+an already persisted result failed. This proves a matching mechanism locally;
+installation and an exact original live retry remain parent-owned acceptance.
+
+Post-await validation now reuses the existing authenticated durable-run lifecycle
+to hydrate normally retired cache state, then applies all original source,
+profile, fingerprint, provider, snapshot/epoch, terminal-state and old-owner
+liveness checks. An explicit foreign cache owner is denied and never overwritten.
+The original durable source/status/PID/start/fingerprint and producer snapshot
+are not rewritten. Recovery does not launch another worker. The same validation
+covers snapshot-recovery and pre-commit await boundaries; IDs and copied producer
+metadata do not grant authority.
+
+Regression uses actual API-generated runs, real owner-process exit and temporary
+SQLite custody, native sweeper calls during the producer read, and HTTP result
+commit/retry to the exact original row. Synthetic provider/model transport is
+explicit; no private history or production fixture is read or changed. Existing
+live-owner/failed/unqualified/foreign-auth denials remain exercised, plus provider
+revocation and explicit foreign ownership during the awaited producer read.
+
+Verification: 111 tests across seven owning API/source/run/SSE/room-grant/
+multiplex files pass in 20.4 seconds (`/tmp/source-retirement-broad.log`);
+the red reproduction is `/tmp/source-retirement-red.log`.
+Jev compact advisory receipt is retained in
+[settled-source-retirement-jev.json](settled-source-retirement-jev.json).
+Invocation: `hermes -p default jev evaluate --file /tmp/settled-retirement-outcome.json`;
+input SHA-256 `54efbdae2138fc81d6413757a374cd6e93dd9e21821742be1db388ccbe8afb1e`.
+No score establishes execution authority or live delivery acceptance.

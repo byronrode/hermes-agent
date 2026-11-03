@@ -137,6 +137,22 @@ def read_source(owner, scope, run_id, *, snapshot=None, allow_unsnapshotted=Fals
     return original
 
 
+def revalidate_source(owner, request, scope, run_id, *, snapshot):
+    """A remote await may cross normal terminal cache retirement.
+
+    Rehydrate through the existing authenticated/scoped durable run lifecycle,
+    never by copying a producer snapshot into ownership state. Explicit foreign
+    ownership is a denial, not a cache miss. All source/epoch/liveness guards
+    still run against the current durable reservation and original snapshot.
+    """
+    if (_authorized(owner, request) is not None
+            or owner._run_idempotency_scope(request) != scope
+            or owner._run_owners.get(run_id) not in (None,scope)):
+        raise ValueError('source_owner_unavailable')
+    owner._durable_run_status(request,run_id)
+    return read_source(owner,scope,run_id,snapshot=snapshot)
+
+
 def source_read_budget(provider):
     timeout = getattr(provider, 'read_timeout_seconds', 3.5)
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 30:
@@ -167,7 +183,7 @@ async def resolve_source(owner, request, scope, run_id):
             if source_provider(owner) is not provider:
                 raise ValueError('source_provider_changed')
             phase = 'snapshot_validation'
-            return read_source(owner, scope, run_id, snapshot=snapshot)
+            return revalidate_source(owner, request, scope, run_id, snapshot=snapshot)
     except _FAILURES as error:
         raise SourceResolutionFailure(error, phase) from None
 
@@ -227,7 +243,7 @@ async def handle_result(owner, request):
         phase = 'producer_read'
         result = await asyncio.wait_for(provider.read_result(source), timeout=timeout)
         phase = 'producer_validation'
-        if source_provider(owner) is not provider or source != read_source(owner, scope, run_id, snapshot=source):
+        if source_provider(owner) is not provider or source != revalidate_source(owner, request, scope, run_id, snapshot=source):
             raise ValueError('source_changed')
         delivery = _delivery(result, source)
         if delivery is None:
@@ -254,7 +270,7 @@ async def handle_result(owner, request):
                 raise ValueError('stale_first_source_result')
         # Persist first validation before the transcript lease can defer writing.
         owner._run_idempotency_store.remember_source_result(scope, run_id, source, delivery)
-        if source != read_source(owner, scope, run_id, snapshot=source):
+        if source != revalidate_source(owner, request, scope, run_id, snapshot=source):
             raise ValueError('source_changed_before_delivery')
         row = await asyncio.to_thread(db.append_source_result_delivery, session,
             delivery['content'], delivery['metadata'], display_kind=delivery['display_kind'])

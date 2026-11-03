@@ -21,6 +21,17 @@ Before setup, here's the part most people want to know: how Hermes behaves once 
 | **Shared channels with multiple users** | By default, Hermes isolates session history per user inside the channel for safety and clarity. Two people talking in the same channel do not share one transcript unless you explicitly disable that. |
 | **Messages mentioning other users** | When `DISCORD_IGNORE_NO_MENTION` is `true` (the default), Hermes stays silent if a message @mentions other users but does **not** mention the bot. This prevents the bot from jumping into conversations directed at other people. Set to `false` if you want the bot to respond to all messages regardless of who is mentioned. This only applies in server channels, not DMs. |
 
+A human can also explicitly address the connected bot with its Discord-managed
+bot role (`<@&ROLE_ID>`), even when Discord leaves the user-mention list empty.
+The role must resolve in that message's guild, be managed by Discord, and have
+`tags.bot_id` equal to the connected bot's own user ID. Same-name unmanaged roles
+and another bot's role do not count. Normal sender authorization still applies;
+this does not enable mention-free responses. Bot-authored role mentions do not
+count as this human summons and do not satisfy the inline user-mention guard.
+The existing missed-message backfill uses the same checks on REST-fetched
+messages; recovery windows, channel limits and dispatch/attempt bounds are
+unchanged and remain operator-controlled.
+
 :::tip
 If you want a normal bot-help channel where people can talk to Hermes without tagging it every time, add that channel to `DISCORD_FREE_RESPONSE_CHANNELS`.
 :::
@@ -985,3 +996,12 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
 
 
+
+Developer verification for managed-role recognition: 42 tests across six native
+mention/admission/backfill/source files pass, including actual discord.py role
+and message objects; transport fixtures are synthetic. The original live
+request is not replayed by these tests. Compact independent advisory receipt:
+[managed-role outcome](../../developer-guide/discord-managed-role-jev.json).
+Invocation: `hermes -p default jev evaluate --file /tmp/managed-role-outcome.json`;
+input SHA-256 `0a2e9b0f9c032b5ccf3ecfa65f1b8d753e3046084155f237591d78d16ceeeba3`.
+Receipt is not an execution grant or live delivery acceptance.

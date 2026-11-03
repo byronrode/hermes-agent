@@ -5000,12 +5000,37 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return {match.group(1) for match in re.finditer(r"<@!?(\d+)>", content)}
 
     def _self_is_explicitly_mentioned(self, message: Any) -> bool:
-        """True when the bot is in ``message.mentions`` or raw-mentioned in the content."""
+        """User mention, or a human's literal mention of our own managed bot role."""
         if not self._client or not self._client.user:
             return False
         if self._client.user in getattr(message, "mentions", []):
             return True
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+        if str(self._client.user.id) in self._raw_mentioned_user_ids(message):
+            return True
+        return bool(self._self_managed_role_ids(message))
+
+    def _self_managed_role_ids(self, message: Any) -> set:
+        """Return only literal, cached managed roles belonging to this bot."""
+        if not self._client or not self._client.user:
+            return set()
+        # Discord's managed bot-role mention is not included in mentions[].
+        # Resolve only exact native guild role metadata, never a display name,
+        # arbitrary role or bot-authored role chorus. Bot inline-user gates stay
+        # separate in _self_is_raw_mentioned.
+        if (getattr(getattr(message, 'author', None), 'bot', None) is not False
+                or getattr(message, 'webhook_id', None) is not None):
+            return set()
+        guild = getattr(message, 'guild', None)
+        if guild is None or getattr(getattr(message, 'channel', None), 'guild', None) is not guild:
+            return set()
+        role_ids = set(re.findall(r'<@&(\d+)>', getattr(message, 'content', '') or ''))
+        recognized = set()
+        for role in getattr(message, 'role_mentions', ()):
+            if (str(role.id) in role_ids and getattr(role, 'guild', None) is guild
+                    and guild.get_role(role.id) is role and getattr(role, 'managed', False) is True
+                    and getattr(getattr(role, 'tags', None), 'bot_id', None) == self._client.user.id):
+                recognized.add(str(role.id))
+        return recognized
 
     def _self_is_raw_mentioned(self, message: Any) -> bool:
         """True only for a literal ``<@bot>`` token: reply-pings add us to ``message.mentions``
@@ -5997,6 +6022,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if self._client.user:
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
+                for role_id in self._self_managed_role_ids(message):
+                    normalized_content = normalized_content.replace(f"<@&{role_id}>", "").strip()
             message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}

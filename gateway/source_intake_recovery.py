@@ -59,8 +59,9 @@ def failed_intake(db, message_id, tool_name):
                 raw = function.get('arguments')
                 args = json.loads(raw) if isinstance(raw,str) else raw
                 if function.get('name') == 'tool_call':
-                    nested = args.get('calls',[]) if isinstance(args,dict) else []
-                    if len(nested) != 1 or nested[0].get('name') != tool_name:
+                    from tools.tool_search_validation import normalize_tool_call_entries
+                    nested, error = normalize_tool_call_entries(args) if isinstance(args,dict) else ([], 'invalid')
+                    if error or len(nested) != 1 or nested[0].get('name') != tool_name:
                         continue
                     args = nested[0].get('arguments')
                 elif function.get('name') != tool_name:

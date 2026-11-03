@@ -34,14 +34,14 @@ def interrupted_owner(path, pipe):
     db.close()
 
 
-async def fixture(tmp_path, monkeypatch):
+async def fixture(tmp_path, monkeypatch, encoded_arguments=False):
     r = rig(tmp_path,monkeypatch)
     sources=[]
     await execute(r,monkeypatch,lambda:sources.append(current_gateway_source()))
     source=sources[0]
     args={'items':[{'number':1,'title':'Synthetic support request','brief':'Read only','domain':'ignis'}]}
     calls=[{'id':'original-call','function':{'name':'tool_call',
-        'arguments':json.dumps({'calls':[{'name':'synthetic_intake','arguments':args}]})}}]
+        'arguments':json.dumps({'calls':[{'name':'synthetic_intake','arguments':json.dumps(args) if encoded_arguments else args}]})}}]
     r.db.append_message('source-session','assistant','',tool_calls=calls)
     result_row=r.db.append_message('source-session','tool',json.dumps(dict(blocked_phase='canonical_capture',
         execution_verified=False,delivery_verified=False)),tool_name='synthetic_intake',tool_call_id='original-call')
@@ -84,8 +84,9 @@ async def close(f):
 
 
 @pytest.mark.asyncio
-async def test_authenticated_failed_intake_exact_replay_restart_and_current_permission(tmp_path,monkeypatch):
-    f=await fixture(tmp_path,monkeypatch)
+@pytest.mark.parametrize('encoded_arguments', [False, True])
+async def test_authenticated_failed_intake_exact_replay_restart_and_current_permission(tmp_path,monkeypatch,encoded_arguments):
+    f=await fixture(tmp_path,monkeypatch,encoded_arguments)
     try:
         url='/v1/gateway-sources/444/retry-intake'
         headers={'Authorization':'Bearer synthetic-operator-key'}

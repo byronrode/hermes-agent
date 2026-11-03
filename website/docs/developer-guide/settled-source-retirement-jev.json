@@ -1,0 +1,52 @@
+{
+  "model": "jev-1.14.0",
+  "answers": {
+    "candidate": {
+      "type": "noul",
+      "noul": 0.86
+    },
+    "boundary": {
+      "type": "noul",
+      "noul": 0.81
+    },
+    "authority": {
+      "type": "noul",
+      "noul": 0.91
+    }
+  },
+  "usage": {
+    "input_tokens": 618,
+    "output_tokens": 52
+  },
+  "backend": "typesafe",
+  "latency_ms": 442.9434579797089,
+  "review": {
+    "advisory_only": true,
+    "execution_authorized": false,
+    "review_policy_enabled": false,
+    "threshold": null,
+    "threshold_calibrated": false,
+    "review_questions": [],
+    "signals": {
+      "candidate": {
+        "probability_yes": 0.86,
+        "basis": "probability_band",
+        "needs_review": null
+      },
+      "boundary": {
+        "probability_yes": 0.81,
+        "basis": "probability_band",
+        "needs_review": null
+      },
+      "authority": {
+        "probability_yes": 0.91,
+        "basis": "probability_band",
+        "needs_review": null
+      }
+    },
+    "note": "Review heuristic only. Preserve human approval and deterministic safety checks regardless of these scores."
+  },
+  "ok": true,
+  "advisory_only": true,
+  "execution_authorized": false
+}

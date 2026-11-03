@@ -54,7 +54,11 @@ def admission_source(*, message, authenticated, profile, run_id, session_id, sco
     return {**source, **attributes}
 
 
-def read_source(owner, scope, run_id):
+class SourceSnapshotUnavailable(ValueError):
+    pass
+
+
+def read_source(owner, scope, run_id, *, snapshot=None, allow_unsnapshotted=False):
     store = owner._run_idempotency_store
     if not store.durable or owner._run_owners.get(run_id) != scope:
         raise ValueError('source_owner_unavailable')
@@ -66,6 +70,13 @@ def read_source(owner, scope, run_id):
     from hermes_cli.profiles import get_active_profile_name
     current = owner._run_statuses.get(run_id) or {}
     accepted = datetime.fromisoformat(source['accepted_at'])
+    same_owner = (record['owner_pid'], record['owner_started']) == (owner._run_owner_pid, owner._run_owner_started)
+    if not same_owner:
+        from gateway.platforms.api_server_runs import _owner_alive
+        if (status.get('status') != 'completed' or current.get('status') != 'completed'
+                or record['owner_pid'] <= 0 or record['owner_started'] <= 0
+                or _owner_alive(record['owner_pid'], record['owner_started'])):
+            raise ValueError('source_owner_changed')
     if (provider is None or provider.name != source['provider'] or source['profile'] != get_active_profile_name()
             or source['run_id'] != run_id or source['auth_scope'] != scope
             or source['body_fingerprint'] != record['fingerprint']
@@ -76,11 +87,51 @@ def read_source(owner, scope, run_id):
             or current.get('run_id') != run_id or current.get('session_id') != source['session_id']
             or current.get('status') not in {'queued', 'running', 'completed', 'waiting_for_approval'}
             or current.get('delivery_id')
-            or (record['owner_pid'], record['owner_started']) != (owner._run_owner_pid, owner._run_owner_started)
             or not 0 <= (datetime.now(timezone.utc) - accepted).total_seconds() <= store.RETENTION_SECONDS):
         raise ValueError('source_owner_changed')
-    return {**source, 'owner_pid': record['owner_pid'], 'owner_started': record['owner_started'],
-            'owner_revision': owner._run_owner_revision}
+    base = {**source, 'owner_pid': record['owner_pid'], 'owner_started': record['owner_started'],
+            'owner_revision': owner._run_owner_revision if same_owner else None}
+    if same_owner:
+        return base
+    pending = store.source_result_for_run(scope, run_id)
+    if pending is not None and (not isinstance(pending, dict) or not isinstance(pending.get('accepted_source'), dict)):
+        raise ValueError('settled_source_snapshot_changed')
+    original = pending['accepted_source'] if pending is not None else snapshot
+    if original is None:
+        if allow_unsnapshotted:
+            return base
+        raise SourceSnapshotUnavailable('settled_source_snapshot_required')
+    if (not isinstance(original, dict) or set(original) != set(base)
+            or any(original[k] != v for k,v in base.items() if k != 'owner_revision')
+            or not re.fullmatch(r'[0-9a-f]{40}', str(original['owner_revision']))):
+        raise ValueError('settled_source_snapshot_changed')
+    return original
+
+
+def source_read_budget(provider):
+    timeout = getattr(provider, 'read_timeout_seconds', 3.5)
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 30:
+        raise ValueError('invalid_source_read_budget')
+    return timeout
+
+
+async def resolve_source(owner, request, scope, run_id):
+    # Reuse the authenticated durable-run lifecycle; it marks abandoned active
+    # runs interrupted and NEVER launches/reassigns a model or admission.
+    owner._durable_run_status(request, run_id)
+    try:
+        return read_source(owner, scope, run_id)
+    except SourceSnapshotUnavailable:
+        provider = source_provider(owner)
+        recover = getattr(provider, 'recover_source', None)
+        if not callable(recover):
+            raise
+        base = read_source(owner, scope, run_id, allow_unsnapshotted=True)
+        timeout = source_read_budget(provider)
+        snapshot = await asyncio.wait_for(recover(base), timeout)
+        if source_provider(owner) is not provider:
+            raise ValueError('source_provider_changed')
+        return read_source(owner, scope, run_id, snapshot=snapshot)
 
 
 def _authorized(owner, request):
@@ -97,7 +148,7 @@ async def handle_source(owner, request):
     if error is not None:
         return error
     try:
-        source = read_source(owner, owner._run_idempotency_scope(request), request.match_info['run_id'])
+        source = await resolve_source(owner, request, owner._run_idempotency_scope(request), request.match_info['run_id'])
     except _FAILURES:
         return web.json_response({'error': 'source_unavailable'}, status=404)
     return web.json_response(source)
@@ -126,15 +177,13 @@ async def handle_result(owner, request):
         if await request.json() != {}:
             raise ValueError('no_result_or_destination_arguments')
         scope, run_id = owner._run_idempotency_scope(request), request.match_info['run_id']
-        source = read_source(owner, scope, run_id)
+        source = await resolve_source(owner, request, scope, run_id)
         provider = source_provider(owner)
         # The registered external owner must revalidate current authority and
         # immutable proof even for a previously validated/persisted result.
-        timeout = getattr(provider, 'read_timeout_seconds', 3.5)
-        if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 30:
-            raise ValueError('invalid_source_read_budget')
+        timeout = source_read_budget(provider)
         result = await asyncio.wait_for(provider.read_result(source), timeout=timeout)
-        if source_provider(owner) is not provider or source != read_source(owner, scope, run_id):
+        if source_provider(owner) is not provider or source != read_source(owner, scope, run_id, snapshot=source):
             raise ValueError('source_changed')
         delivery = _delivery(result, source)
         if delivery is None:
@@ -160,7 +209,7 @@ async def handle_result(owner, request):
                 raise ValueError('stale_first_source_result')
         # Persist first validation before the transcript lease can defer writing.
         owner._run_idempotency_store.remember_source_result(scope, run_id, source, delivery)
-        if source != read_source(owner, scope, run_id):
+        if source != read_source(owner, scope, run_id, snapshot=source):
             raise ValueError('source_changed_before_delivery')
         row = await asyncio.to_thread(db.append_source_result_delivery, session,
             delivery['content'], delivery['metadata'], display_kind=delivery['display_kind'])

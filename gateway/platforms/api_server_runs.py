@@ -397,23 +397,46 @@ def _owner_alive(owner_pid: int, owner_started: int) -> bool:
 def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, Any] | None:
     """Hydrate a scoped run status and fail stale owners closed."""
     status = self._run_statuses.get(run_id)
+    record = None
     if status is not None:
         if run_id in self._run_idempotency_ids:
             scope = self._run_idempotency_scope(request)
-            self._run_idempotency_store.extend_retention(scope, run_id, _room_retention_until(request))
-        return status
+            # A hydrated nonterminal run may still belong to another process.
+            # Its durable status can settle after our first read; do not pin the
+            # replacement server to that early snapshot forever. Locally active
+            # tasks and foreign scopes retain their existing cache/owner guards.
+            refresh = (status.get('status') not in TERMINAL_STATUSES
+                       and run_id not in getattr(self, '_active_run_tasks', {})
+                       and self._run_owners.get(run_id) == scope)
+            if refresh:
+                record = self._run_idempotency_store.status_for_run(
+                    scope, run_id, retention_until=_room_retention_until(request))
+                refresh = bool(record and int(record.get('owner_pid') or 0) > 0
+                               and int(record.get('owner_started') or 0) > 0
+                               and (record['owner_pid'], record['owner_started']) !=
+                               (self._run_owner_pid, self._run_owner_started))
+            if not refresh:
+                self._run_idempotency_store.extend_retention(scope, run_id, _room_retention_until(request))
+                return status
+        else:
+            return status
     scope = self._run_idempotency_scope(request)
-    record = self._run_idempotency_store.status_for_run(
+    record = record or self._run_idempotency_store.status_for_run(
         scope, run_id, retention_until=_room_retention_until(request))
     if record is None:
         return None
     status = dict(record["status"])
     if status.get("status") not in TERMINAL_STATUSES and not _owner_alive(
         int(record.get("owner_pid") or 0), int(record.get("owner_started") or 0)):
-        status.update(
-            status="interrupted", error="The gateway restarted before this run settled.",
-            last_event="run.interrupted", updated_at=time.time())
-        self._run_idempotency_store.update_status(run_id, status)
+        # The original can commit completion and exit between our first read
+        # and liveness check. Once it is dead, re-read before marking abandoned.
+        settled = self._run_idempotency_store.status_for_run(scope, run_id)
+        status = dict(settled['status']) if settled is not None else status
+        if status.get('status') not in TERMINAL_STATUSES:
+            status.update(
+                status="interrupted", error="The gateway restarted before this run settled.",
+                last_event="run.interrupted", updated_at=time.time())
+            self._run_idempotency_store.update_status(run_id, status)
     self._run_statuses[run_id] = status
     self._run_idempotency_ids.add(run_id)
     self._run_owners[run_id] = scope

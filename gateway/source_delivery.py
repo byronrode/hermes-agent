@@ -47,6 +47,19 @@ async def drain_gateway_sources(runner):
             continue
         try:
             restored, adapter = _source_route(runner,db,source)
+            if callable(getattr(provider,'retry_gateway_intake',None)):
+                # An opted-in provider may repair its exact persisted failed
+                # intake under the same source custody. No model/event replay.
+                from gateway.source_intake_recovery import retry_failed_intake
+                try:
+                    from gateway.platforms.api_server_runs import _submit_api_worker
+                    work = _submit_api_worker(asyncio.get_running_loop(),
+                        lambda: retry_failed_intake(runner,source['message_id']))
+                    await asyncio.shield(work)
+                except (ValueError,RuntimeError,OSError,KeyError,TypeError):
+                    # Unqualified/live/exhausted sources cannot be retried;
+                    # an already captured result still uses ordinary readback.
+                    pass
             from gateway.platforms.api_server_source_receipts import _delivery
             result = await asyncio.wait_for(provider.read_result(source),timeout=min(
                 30,max(0.1,float(getattr(provider,'read_timeout_seconds',3.5)))))

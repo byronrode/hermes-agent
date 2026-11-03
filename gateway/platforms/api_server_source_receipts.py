@@ -58,6 +58,35 @@ class SourceSnapshotUnavailable(ValueError):
     pass
 
 
+_DIAGNOSTIC_REASONS = frozenset({
+    'source_owner_unavailable','source_not_qualified','source_owner_changed',
+    'settled_source_snapshot_required','settled_source_snapshot_changed',
+    'source_provider_changed','snapshot_recovery_unavailable','invalid_source_read_budget',
+    'source_changed','source_changed_before_delivery','no_result_or_destination_arguments',
+    'source_binding_mismatch','malformed_source_result','source_result_identity_changed',
+    'persisted_source_result_changed','stale_first_source_result','delivery_readback_failed',
+})
+
+
+def source_diagnostic(error, phase):
+    if isinstance(error, SourceResolutionFailure):
+        return error.diagnostic
+    reason = str(error)
+    kind = type(error).__name__
+    kinds = {'ValueError','KeyError','TypeError','OSError','RuntimeError','TimeoutError',
+             'JSONDecodeError','OperationalError','RequestLifecycleError','PaperclipError','PermissionError'}
+    # Provider, JSON and OS messages can contain private input or credentials.
+    return {'phase':phase, 'error_type':kind if kind in kinds else 'SourceError',
+            'reason':reason if reason in _DIAGNOSTIC_REASONS else
+            ('source_read_timeout' if isinstance(error, TimeoutError) else 'source_read_failed')}
+
+
+class SourceResolutionFailure(ValueError):
+    def __init__(self, error, phase):
+        self.diagnostic = source_diagnostic(error, phase)
+        super().__init__('source_resolution_failed')
+
+
 def read_source(owner, scope, run_id, *, snapshot=None, allow_unsnapshotted=False):
     store = owner._run_idempotency_store
     if not store.durable or owner._run_owners.get(run_id) != scope:
@@ -118,20 +147,29 @@ def source_read_budget(provider):
 async def resolve_source(owner, request, scope, run_id):
     # Reuse the authenticated durable-run lifecycle; it marks abandoned active
     # runs interrupted and NEVER launches/reassigns a model or admission.
-    owner._durable_run_status(request, run_id)
+    phase = 'durable_status'
     try:
-        return read_source(owner, scope, run_id)
-    except SourceSnapshotUnavailable:
-        provider = source_provider(owner)
-        recover = getattr(provider, 'recover_source', None)
-        if not callable(recover):
-            raise
-        base = read_source(owner, scope, run_id, allow_unsnapshotted=True)
-        timeout = source_read_budget(provider)
-        snapshot = await asyncio.wait_for(recover(base), timeout)
-        if source_provider(owner) is not provider:
-            raise ValueError('source_provider_changed')
-        return read_source(owner, scope, run_id, snapshot=snapshot)
+        owner._durable_run_status(request, run_id)
+        phase = 'source_validation'
+        try:
+            return read_source(owner, scope, run_id)
+        except SourceSnapshotUnavailable:
+            phase = 'snapshot_provider'
+            provider = source_provider(owner)
+            recover = getattr(provider, 'recover_source', None)
+            if not callable(recover):
+                raise ValueError('snapshot_recovery_unavailable')
+            base = read_source(owner, scope, run_id, allow_unsnapshotted=True)
+            timeout = source_read_budget(provider)
+            phase = 'snapshot_recovery'
+            snapshot = await asyncio.wait_for(recover(base), timeout)
+            phase = 'snapshot_provider_validation'
+            if source_provider(owner) is not provider:
+                raise ValueError('source_provider_changed')
+            phase = 'snapshot_validation'
+            return read_source(owner, scope, run_id, snapshot=snapshot)
+    except _FAILURES as error:
+        raise SourceResolutionFailure(error, phase) from None
 
 
 def _authorized(owner, request):
@@ -149,8 +187,9 @@ async def handle_source(owner, request):
         return error
     try:
         source = await resolve_source(owner, request, owner._run_idempotency_scope(request), request.match_info['run_id'])
-    except _FAILURES:
-        return web.json_response({'error': 'source_unavailable'}, status=404)
+    except _FAILURES as error:
+        return web.json_response({'error': 'source_unavailable',
+                                  'diagnostic':source_diagnostic(error,'source_validation')}, status=404)
     return web.json_response(source)
 
 
@@ -173,21 +212,27 @@ async def handle_result(owner, request):
     error = _authorized(owner, request)
     if error is not None:
         return error
+    phase = 'request_validation'
     try:
         if await request.json() != {}:
             raise ValueError('no_result_or_destination_arguments')
         scope, run_id = owner._run_idempotency_scope(request), request.match_info['run_id']
         source = await resolve_source(owner, request, scope, run_id)
+        phase = 'producer_lookup'
         provider = source_provider(owner)
         # The registered external owner must revalidate current authority and
         # immutable proof even for a previously validated/persisted result.
+        phase = 'producer_budget'
         timeout = source_read_budget(provider)
+        phase = 'producer_read'
         result = await asyncio.wait_for(provider.read_result(source), timeout=timeout)
+        phase = 'producer_validation'
         if source_provider(owner) is not provider or source != read_source(owner, scope, run_id, snapshot=source):
             raise ValueError('source_changed')
         delivery = _delivery(result, source)
         if delivery is None:
             return web.json_response({'state': result.get('state') if result.get('state') in {'queued','unavailable'} else 'unavailable'})
+        phase = 'delivery_commit'
         db = await owner._ensure_session_db_async()
         session = await asyncio.to_thread(db.resolve_resume_session_id, source['session_id']) or source['session_id']
         # Check durable identity BEFORE applying a new-result age limit. Both the
@@ -217,5 +262,6 @@ async def handle_result(owner, request):
         if persisted is None or persisted['id'] != row or persisted['content'] != delivery['content'] or persisted['metadata'] != delivery['metadata']:
             raise ValueError('delivery_readback_failed')
         return web.json_response({'state':'persisted','run_id':run_id,'session_id':source['session_id'],'message_id':row})
-    except _FAILURES:
-        return web.json_response({'state':'unavailable'}, status=503)
+    except _FAILURES as error:
+        return web.json_response({'state':'unavailable',
+                                  'diagnostic':source_diagnostic(error,phase)}, status=503)

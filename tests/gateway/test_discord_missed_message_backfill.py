@@ -570,3 +570,31 @@ async def test_stored_cursor_cannot_widen_scan_window_or_leak_into_threads(adapt
         pass
     assert not isinstance(channel.seen_after[-1], dt.datetime)  # newer cursor narrows (discord.Object)
     assert thread.seen_after[-1] == window_floor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['own', 'foreign_bot', 'unmanaged', 'wrong_guild', 'uncached',
+                                  'no_token', 'no_role_metadata', 'bot_author', 'unauthorized'])
+async def test_managed_bot_role_recovery_preserves_strict_mention_and_auth(adapter, monkeypatch, case):
+    """Synthetic REST-shaped role mention: mentions=[] while role_mentions resolves the guild role."""
+    message=make_message(content='<@&555> Ask support for today’s status. Do not send customer replies.')
+    guild=message.guild
+    role=SimpleNamespace(id=555,name='Mara',guild=guild,managed=True,
+                         tags=SimpleNamespace(bot_id=adapter._client.user.id))
+    message.role_mentions=[role]
+    guild.get_role=lambda identity:role if identity==555 else None
+    adapter.config.extra.update(require_mention=True,free_response_channels=[],allow_bots='all')
+    monkeypatch.setattr(adapter,'_is_allowed_user',lambda *_a,**_k:case!='unauthorized')
+    if case=='foreign_bot':role.tags.bot_id=12345
+    if case=='unmanaged':role.managed=False
+    if case=='wrong_guild':role.guild=SimpleNamespace(id=99999)
+    if case=='uncached':guild.get_role=lambda _:None
+    if case=='no_token':message.content='@Mara Ask support for status'
+    if case=='no_role_metadata':message.role_mentions=[]
+    if case=='bot_author':message.author.bot=True
+    admitted=await adapter._dispatch_recovered_message(message)
+    assert admitted is (case=='own')
+    if case=='own':
+        adapter._handle_message.assert_awaited_once_with(message,role_authorized=False,recovered=True)
+        assert not adapter._self_is_raw_mentioned(message)  # never a bot inline-user grant
+    else:adapter._handle_message.assert_not_awaited()

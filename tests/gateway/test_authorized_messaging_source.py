@@ -344,3 +344,32 @@ async def test_held_sources_rotate_without_revoking_custody_or_resending(tmp_pat
         r.provider.read_result.assert_awaited_once()  # revoked actors were never read or sent
     finally:
         r.db.close();await r.adapter._client.close()
+
+
+@pytest.mark.asyncio
+async def test_native_sdk_managed_role_mention_is_human_summons_only(tmp_path,monkeypatch):
+    """Real discord.py role/tag/message objects; no network or live original-message replay."""
+    r=rig(tmp_path,monkeypatch)
+    try:
+        state=r.adapter._client._connection
+        state.user=discord.ClientUser(state=state,data={'id':'999','username':'Mara','discriminator':'0','avatar':None})
+        message=r.event.raw_message
+        guild=message.guild
+        role=discord.Role(guild=guild,state=state,data={'id':'555','name':'Mara','managed':True,
+            'permissions':'0','position':1,'color':0,'hoist':False,'mentionable':True,'tags':{'bot_id':'999'}})
+        guild._roles[role.id]=role
+        message.content='<@&555> Ask support for today’s status. Do not send customer replies.'
+        message.mentions=[];message.role_mentions=[role]
+        assert r.adapter._self_is_explicitly_mentioned(message)
+        assert not r.adapter._self_is_raw_mentioned(message)
+        r.adapter._allowed_user_ids={str(message.author.id)}
+        assert r.adapter._discord_message_admission(message,claim=False)[0]
+        r.adapter._allowed_user_ids={'foreign-actor'}
+        assert not r.adapter._discord_message_admission(message,claim=False)[0]
+        role.tags.bot_id=111
+        assert not r.adapter._self_is_explicitly_mentioned(message)
+        role.tags.bot_id=999
+        message.author.bot=True
+        assert not r.adapter._self_is_explicitly_mentioned(message)
+    finally:
+        r.db.close();await r.adapter._client.close()

@@ -1,0 +1,43 @@
+{
+  "model": "jev-1.14.0",
+  "answers": {
+    "candidate": {
+      "type": "noul",
+      "noul": 0.84
+    },
+    "live_boundary": {
+      "type": "noul",
+      "noul": 0.9
+    }
+  },
+  "usage": {
+    "input_tokens": 605,
+    "output_tokens": 37
+  },
+  "backend": "typesafe",
+  "latency_ms": 443.20387503830716,
+  "review": {
+    "advisory_only": true,
+    "execution_authorized": false,
+    "review_policy_enabled": false,
+    "threshold": null,
+    "threshold_calibrated": false,
+    "review_questions": [],
+    "signals": {
+      "candidate": {
+        "probability_yes": 0.84,
+        "basis": "probability_band",
+        "needs_review": null
+      },
+      "live_boundary": {
+        "probability_yes": 0.9,
+        "basis": "probability_band",
+        "needs_review": null
+      }
+    },
+    "note": "Review heuristic only. Preserve human approval and deterministic safety checks regardless of these scores."
+  },
+  "ok": true,
+  "advisory_only": true,
+  "execution_authorized": false
+}

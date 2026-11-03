@@ -61,7 +61,7 @@ def rig(tmp_path, monkeypatch):
     agent = SimpleNamespace(session_id='source-session')
     _,turn = _bind_turn_identity(agent,'source-session',None,None,None,None)
     provider = SimpleNamespace(qualify_gateway_source=lambda source:{'intent':'ordinary'})
-    manager = SimpleNamespace(_api_source_providers={'synthetic':provider})
+    manager = SimpleNamespace(_api_source_providers={'synthetic':provider},invoke_hook=lambda *args,**kwargs:[])
     monkeypatch.setattr('hermes_cli.plugins.get_plugin_manager',lambda:manager)
     return SimpleNamespace(runner=runner,adapter=adapter,event=event,source=source,db=db,key=key,
         generation=generation,turn=turn,provider=provider,manager=manager)
@@ -90,10 +90,17 @@ async def execute(r, monkeypatch, inside):
         from gateway.run_turn_runner import TurnRunner
         metadata=kwargs.get('persist_user_display_metadata')
         def conversation(message,**call):
-            r.db.append_message(session_id,'user',message,platform_message_id=call['persist_user_platform_id'],
-                display_metadata=call.get('persist_user_display_metadata'))
+            # Use the actual production stages, in production order: hooks run
+            # before the crash-resilient inbound-row flush, never after it.
+            from agent.turn_context import _collect_pre_llm_call_context, _persist_turn_start
+            if not r.db.get_messages(session_id):
+                assert current_gateway_source() is None
+                assert current_gateway_source(admit=False), 'trusted inspection must work before flush'
+            r.pre_llm_context=_collect_pre_llm_call_context(agent,effective_task_id=session_id,turn_id=r.turn,
+                original_user_message=message,messages=[],conversation_history=[])
             before_tool=getattr(r,'before_tool',None)
             if before_tool:before_tool()
+            _persist_turn_start(agent,[],[],None)
             tokens = set_current_observability_context(turn_id=r.turn,session_id=session_id,tool_call_id='synthetic-tool')
             try:
                 value=inside()
@@ -105,6 +112,10 @@ async def execute(r, monkeypatch, inside):
             finally:
                 reset_current_observability_context(tokens)
         agent=SimpleNamespace(run_conversation=conversation,session_id=session_id,platform='discord',_current_turn_id=r.turn)
+        agent.model='synthetic-model'
+        agent._ensure_db_session=lambda:None
+        agent._persist_session=lambda messages,history:r.db.append_message(session_id,'user',message,
+            platform_message_id=r.event.message_id,display_metadata=metadata)
         from agent.tool_guardrails import ToolCallGuardrailController
         from agent.tool_executor import _run_sequential_tool_execution_middleware
         agent._tool_worker_threads_lock=threading.Lock();agent._tool_worker_threads=set()
@@ -141,6 +152,26 @@ async def test_only_authorized_native_external_turn_can_bind_and_scope_revokes(t
             source = current_gateway_source();assert source
             assert source['turn_id'] == r.turn and source['message_id'] == '444'
             captured.append(copy_context())
+            # Exercise the actual bounded native hook worker, not a direct
+            # callback on the agent thread. Only inspection is lent to it.
+            from hermes_cli.plugins import PluginManager
+            hooks=PluginManager()
+            def hook():
+                assert current_gateway_source(admit=False)==source
+                assert current_gateway_source() is None
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    assert pool.submit(copy_context().run,lambda:current_gateway_source(admit=False)).result(timeout=5) is None
+                return 'inspected'
+            assert hooks._run_hook_callback_bounded('pre_llm_call',hook,{},5)=='inspected'
+            release=threading.Event();finished=threading.Event();late=[]
+            def abandoned():
+                assert current_gateway_source(admit=False)==source
+                release.wait(timeout=3)
+                late.append(current_gateway_source(admit=False));finished.set()
+            hooks._run_hook_callback_bounded('pre_llm_call',abandoned,{},0.05)
+            release.set()
+            assert finished.wait(timeout=3) and late==[None]
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 assert pool.submit(copy_context().run,current_gateway_source).result(timeout=5) is None
@@ -278,5 +309,38 @@ async def test_native_ack_restart_unknown_and_late_owner_never_blindly_resend(tm
             revoked.provider.bind_gateway_receipt.assert_not_awaited()
         finally:
             revoked.db.close();await revoked.adapter._client.close()
+    finally:
+        r.db.close();await r.adapter._client.close()
+
+
+@pytest.mark.asyncio
+async def test_held_sources_rotate_without_revoking_custody_or_resending(tmp_path, monkeypatch):
+    r=rig(tmp_path,monkeypatch)
+    try:
+        source=await execute(r,monkeypatch,current_gateway_source)
+        # Persist accepted custody on existing user rows, not a mock pending query.
+        for number in range(101):
+            held=dict(source,run_id=f'held-{number}',message_id=f'held-message-{number}',user_id='999')
+            r.db.append_message('source-session','user','Synthetic held event',
+                platform_message_id=held['message_id'],display_metadata={'gateway_accepted_source':held})
+            obligation=ledger.source_obligation(held,'held-result','Held',{})
+            assert ledger.begin_source_send(obligation['obligation_id'])
+        # Put the deliverable source after the held page, preserving its exact snapshot.
+        r.db._execute_write(lambda conn:conn.execute("UPDATE messages SET id=id+1000 WHERE platform_message_id='444'"))
+        r.provider.read_result=AsyncMock(return_value={'state':'answered','accepted_source':source,
+            'identity':'later-result','content':'Synthetic result','metadata':{'delegation_id':'later-result','source_run_id':source['run_id']},
+            'display_kind':'source_result'})
+        r.provider.bind_gateway_receipt=AsyncMock()
+        r.adapter.send=AsyncMock(return_value=SendResult(success=True,message_id='later-ack'))
+        await drain_gateway_sources(r.runner)
+        r.db.close();r.db=SessionDB(db_path=tmp_path/'state.db');r.runner._session_db=r.db
+        await drain_gateway_sources(r.runner)
+        assert r.adapter.send.await_count==1, 'held first page must not starve a later source'
+        assert r.db.gateway_source_row(source)
+        pending=r.db.pending_gateway_sources()
+        assert all(s['user_id']=='999' for s in pending)
+        with ledger._connect() as conn:
+            assert conn.execute("SELECT count(*) FROM delivery_obligations WHERE state='unknown'").fetchone()[0]==101
+        r.provider.read_result.assert_awaited_once()  # revoked actors were never read or sent
     finally:
         r.db.close();await r.adapter._client.close()

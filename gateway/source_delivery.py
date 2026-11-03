@@ -37,6 +37,10 @@ async def drain_gateway_sources(runner):
             break
         if not isinstance(source,dict):
             continue
+        try:
+            await asyncio.to_thread(db.mark_gateway_source_polled,source)
+        except (ValueError,KeyError,TypeError):
+            continue
         provider = manager._api_source_providers.get(source.get('provider'))
         consume = getattr(provider,'bind_gateway_receipt',None)
         if not provider or not callable(consume):

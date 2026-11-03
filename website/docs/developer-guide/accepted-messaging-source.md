@@ -15,7 +15,14 @@ worker registration; no thread whitelist or second executor is introduced.
 Authorization remains independent of business permission.
 `admit=False` permits the existing pre-LLM guidance hook to inspect current
 native ownership without admitting a durable source. It still requires the real
-agent object's turn, never a caller/hook-provided turn ID. Provider replacement
+agent object's turn, never a caller/hook-provided turn ID. The actual pre-LLM
+hook runs before `_persist_turn_start`: inspection requires current revocable
+runtime ownership but no persisted candidate. The existing bounded pre-LLM
+worker receives inspection only, tied to its exact thread and actual parent
+execution; callback return or timeout revokes it, even if the worker is late.
+Arbitrary copied background contexts and admitting calls remain denied.
+It creates no durable authority;
+admitting tool use still requires the exact persisted candidate row. Provider replacement
 revokes the current scope even if the old registration is later restored.
 
 The gateway stamps `gateway_source_candidate` on its existing persisted native
@@ -42,7 +49,12 @@ result shape and validator. It must revalidate its own business/canonical source
 and native work on every read; it cannot choose the original recipient.
 
 The existing supervised completion watcher calls `drain_gateway_sources` while
-sessions are idle. It projects accepted user-row metadata only, revalidates
+sessions are idle. It projects at most 100 accepted user rows ordered by the
+existing custody metadata's `gateway_source_poll_sequence`. Each attempted row
+is conditionally stamped with the next sequence before inspection, so revoked
+or unknown sources cannot monopolize the page, even after restart or a drain
+deadline partway through a page. This scheduling counter never changes source
+authority, meaningful progress or delivery state. The watcher revalidates
 current authorization and the exact delivery adapter before and after producer
 read/send, commits the exact detached SessionDB result and uses the existing
 `delivery_obligations` table for the native send. No new model turn, worker,
@@ -59,7 +71,9 @@ or lost ACK remains held and is excluded from generic blind redelivery. A pendin
 unattempted obligation may be claimed once after restart. A delivered obligation
 is re-read and only its provider-binding callback retried, never sent again.
 Minimal source-bound outbox receipts are retained for subsequent OS/canonical revalidation;
-normal final-response outbox retention/recovery stays unchanged.
+both age and capacity pruning exclude every source-bound obligation, including
+pending, unknown and delivered-awaiting-provider-binding receipts. Ordinary
+rows retain their separate 500-row capacity and normal age/recovery behavior.
 
 `delivery_ledger.source_delivery_receipt(source, identity)` resolves the native
 ACK from durable outbox custody. Consumers must also validate the exact OS source
@@ -78,3 +92,16 @@ adapter replacement, restart, lost central ACK, unknown send ACK and late owner
 denial. Run with the documented PM dev/test environment plus `--extra discord`
 and `HERMES_PYTHON=... scripts/run_tests.sh
 tests/gateway/test_authorized_messaging_source.py`.
+
+Focused opening-review repair (same PR, no additional review): source retention
+regression inserts 525 ordinary obligations while protecting old pending,
+unknown and delivered source receipts. Queue regression persists 101 revoked
+unknown sources before a deliverable source, reopens SQLite between drains and
+verifies a single later ACK without touching held source authority or send state.
+The connected Mara test invokes the actual pre-LLM collector before the actual
+turn-start persistence helper and verifies guidance before durable admission.
+All SDK/model/network fixtures are synthetic; these are source-owner tests,
+not live Discord acceptance.
+
+Focused and broader verification: 216 tests across 18 files pass through the
+PM source runner, including hook failure/event/stream regressions.

@@ -600,11 +600,13 @@ def _prune_unlocked(conn, now: float) -> None:
     conn.execute(
         """DELETE FROM delivery_obligations
            WHERE state IN ('delivered', 'abandoned') AND source_binding IS NULL AND updated_at < ?""", (now - _RETENTION_SECONDS,))
-    total = conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
+    # Source-bound custody is not a disposable retry cache. Even a delivered
+    # ACK may still await provider binding; capacity must never erase it.
+    total = conn.execute("SELECT COUNT(*) FROM delivery_obligations WHERE source_binding IS NULL").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
             """DELETE FROM delivery_obligations WHERE obligation_id IN (
-                 SELECT obligation_id FROM delivery_obligations
+                 SELECT obligation_id FROM delivery_obligations WHERE source_binding IS NULL
                  ORDER BY CASE state
                             WHEN 'delivered' THEN 0
                             WHEN 'abandoned' THEN 1

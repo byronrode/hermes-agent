@@ -13,6 +13,7 @@ from pathlib import Path
 
 _current = ContextVar('authorized_gateway_source', default=None)
 _execution = ContextVar('authorized_gateway_execution', default=None)
+_inspection = ContextVar('authorized_gateway_inspection', default=None)
 
 
 @contextmanager
@@ -31,11 +32,15 @@ def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def _owns_execution(execution):
+def _owns_execution(execution, *, inspect_only=False):
     from tools.interrupt import is_interrupted
     if not execution or not execution[1] or is_interrupted():
         return False
     tid = threading.get_ident()
+    inspection = _inspection.get()
+    if (inspect_only and inspection and inspection[0] is execution
+            and inspection[1] == tid and inspection[2]):
+        return True
     if execution[0] == tid:
         return True
     # Sequential and parallel native tools use registered daemon workers.
@@ -46,6 +51,28 @@ def _owns_execution(execution):
         return False
     with lock:
         return tid in agent._tool_worker_threads
+
+
+def prepare_gateway_source_inspection():
+    """Native hook dispatcher may lend inspection, never admission, to one worker.
+
+    Capture on the actual agent/tool owner before launching a bounded callback.
+    A copied context in an arbitrary thread cannot create or exercise this scope.
+    The dispatcher revokes on timeout without waiting for an abandoned callback.
+    """
+    execution = _execution.get()
+    inspection = [execution,None,_owns_execution(execution)]
+    def run(callback, *args):
+        inspection[1] = threading.get_ident()
+        token = _inspection.set(inspection)
+        try:
+            return callback(*args)
+        finally:
+            inspection[2] = False
+            _inspection.reset(token)
+    def revoke():
+        inspection[2] = False
+    return run,revoke
 
 
 @contextmanager
@@ -91,7 +118,7 @@ def authorized_event_scope(runner, event, source, session_id, session_key, gener
         tip = (db.resolve_resume_session_id(session_id) or session_id) if db else session_id
         sessions = {session_id,tip}
         if (not active or base is None or is_delegated_child_process_context()
-                or not _owns_execution(execution)
+                or not _owns_execution(execution,inspect_only=not admit)
                 or Path(get_hermes_home()).resolve() != home
                 or runner._intake_adapter_for(source) is not intake
                 or intake.is_connected is not True
@@ -128,6 +155,10 @@ def authorized_event_scope(runner, event, source, session_id, session_key, gener
         selected_owner = (manager,provider)
         if not isinstance(choice,dict) or set(choice) != {'intent'}:
             return None
+        if not admit:
+            # Hooks precede the inbound-row flush. This revocable inspection is
+            # guidance only: admitting tools must still bind the durable row.
+            return dict(base,turn_id=execution[2]._current_turn_id,provider=name,intent=choice['intent'])
         bound = db.bind_gateway_source_turn(session_id,base,execution[2]._current_turn_id,
             {'provider':name,'intent':choice['intent']},admit=admit)
         if admit and bound and display_metadata is not None:

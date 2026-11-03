@@ -162,10 +162,30 @@ class SessionMessagesMixin:
         """Metadata-only projection of opted-in accepted sources, never channel history."""
         accepted = _sql_json_extract('m.display_metadata','$.gateway_accepted_source')
         consumed = _sql_json_extract('m.display_metadata','$.gateway_source_consumed')
+        polled = _sql_json_extract('m.display_metadata','$.gateway_source_poll_sequence')
         rows = self._read_all("SELECT m.display_metadata FROM messages m JOIN sessions s ON s.id=m.session_id "
             f"WHERE s.source='discord' AND m.role='user' AND {accepted} IS NOT NULL "
-            f"AND coalesce({consumed},0)=0 ORDER BY m.id LIMIT 100")
+            f"AND coalesce({consumed},0)=0 ORDER BY coalesce({polled},0),m.id LIMIT 100")
         return [json.loads(row[0])['gateway_accepted_source'] for row in rows]
+
+    def mark_gateway_source_polled(self, source):
+        """Rotate attempted custody fairly, including held/revoked sources.
+
+        This counter schedules inspection; it is never progress, authorization
+        or delivery evidence. Mark only attempted rows so a bounded drain that
+        stops mid-page cannot repeatedly starve the rest of that page.
+        """
+        row_id = self.gateway_source_row(source)
+        polled = _sql_json_extract('display_metadata','$.gateway_source_poll_sequence')
+        def write(conn):
+            row = conn.execute('SELECT display_metadata FROM messages WHERE id=?',(row_id,)).fetchone()
+            meta = json.loads(row[0] or '{}') if row else {}
+            if meta.get('gateway_accepted_source') != source:
+                raise ValueError('gateway_source_custody_changed')
+            sequence = conn.execute(f'SELECT coalesce(max({polled}),0)+1 FROM messages').fetchone()[0]
+            meta['gateway_source_poll_sequence'] = sequence
+            conn.execute('UPDATE messages SET display_metadata=? WHERE id=?',(json.dumps(meta,sort_keys=True),row_id))
+        self._execute_write(write)
 
     def gateway_source_row(self, source):
         session = self.get_session(source['session_id'])

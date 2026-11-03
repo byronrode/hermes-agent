@@ -83,6 +83,7 @@ _CAPABILITY_ENDPOINTS = (
     ("run_status", ("GET", "/v1/runs/{run_id}")),
     ("run_source_receipt", ("GET", "/v1/runs/{run_id}/accepted-source")),
     ("run_source_result", ("POST", "/v1/runs/{run_id}/source-result")),
+    ("gateway_intake_retry", ("POST", "/v1/gateway-sources/{message_id}/retry-intake")),
     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
     ("run_steer", ("POST", "/v1/runs/{run_id}/steer")),
@@ -1645,6 +1646,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("GET", "/v1/runs/{run_id}/accepted-source", self._handle_run_source_receipt),
             ("POST", "/v1/runs/{run_id}/source-result", self._handle_run_source_result),
+            ("POST", "/v1/gateway-sources/{message_id}/retry-intake", self._handle_gateway_intake_retry),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
             # Platform event ingress: authenticated by the target adapter's own verifier,
             # NOT API_SERVER_KEY (external platforms hold no API server key).
@@ -4238,6 +4240,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_run_source_result(self, request):
         from gateway.platforms.api_server_source_receipts import handle_result
         return await handle_result(self, request)
+
+    async def _handle_gateway_intake_retry(self, request):
+        from gateway.source_intake_recovery import handle_retry
+        return await handle_retry(self, request)
     _handle_run_events = _run_route_delegate("_handle_run_events")
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
     _handle_steer_run = _run_route_delegate("_handle_steer_run")

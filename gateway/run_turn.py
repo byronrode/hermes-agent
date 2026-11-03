@@ -2206,6 +2206,7 @@ class GatewayTurnMixin:
                     "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                authorized_event=event,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -2935,7 +2936,17 @@ class GatewayTurnMixin:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
         when multiplexing is off)."""
         with self._profile_scope_for_source(source):
-            return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+            event = turn_kwargs.pop('authorized_event', None)
+            from gateway.accepted_source import authorized_event_scope
+            metadata = dict(turn_kwargs.get('persist_user_display_metadata') or {})
+            with authorized_event_scope(self,event,source,session_id,turn_kwargs.get('session_key'),
+                                        turn_kwargs.get('run_generation'),metadata) as candidate:
+                if candidate:
+                    metadata.pop('gateway_accepted_source',None)
+                    metadata.pop('gateway_source_consumed',None)
+                    metadata['gateway_source_candidate'] = candidate
+                    turn_kwargs['persist_user_display_metadata'] = metadata
+                return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
         """Resolve per-platform display, progress, status and streaming-surface settings for a turn."""

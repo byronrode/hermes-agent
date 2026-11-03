@@ -305,6 +305,10 @@ class PluginDispatchMixin:
             self._hook_running_callbacks[gate_key] = token
 
         context = contextvars.copy_context()
+        inspect_run = inspect_revoke = None
+        if hook_name == 'pre_llm_call':
+            from gateway.accepted_source import prepare_gateway_source_inspection
+            inspect_run,inspect_revoke = prepare_gateway_source_inspection()
         done = threading.Event()
         outcome: Dict[str, Any] = {}
         failure: Dict[str, BaseException] = {}
@@ -321,7 +325,10 @@ class PluginDispatchMixin:
 
         def _runner() -> None:
             try:
-                outcome["value"] = context.run(self._invoke_hook_callback, cb, kwargs)
+                if inspect_run is not None:
+                    outcome["value"] = context.run(inspect_run,self._invoke_hook_callback,cb,kwargs)
+                else:
+                    outcome["value"] = context.run(self._invoke_hook_callback, cb, kwargs)
             except BaseException as exc:
                 failure["exc"] = exc
             finally:
@@ -332,12 +339,17 @@ class PluginDispatchMixin:
         try:
             thread.start()
         except RuntimeError as exc:
+            if inspect_revoke is not None:
+                inspect_revoke()
             _release_token()  # the runner's finally never runs when OS thread creation fails
             logger.warning(
                 "Hook '%s' callback %s worker failed to start: %s — skipping",
                 hook_name, callback_name, exc)
             return _HOOK_SKIPPED
-        if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
+        finished = done.wait(timeout=timeout)  # never join an abandoned callback
+        if inspect_revoke is not None:
+            inspect_revoke()
+        if not finished:
             with self._hook_timeout_lock:
                 # See #6622.
                 self._hook_timeout_suppressed_until[suppression_key] = (

@@ -808,3 +808,23 @@ class TestOwnerAlivePidProbe:
 
         monkeypatch.setattr(status, "_pid_exists", boom)
         assert dl._owner_alive(12345, 999) is False
+
+
+def test_source_custody_survives_ordinary_capacity_and_age_retention():
+    source=dict(session_key='synthetic',run_id='source-run',platform='discord',channel_id='222',thread_id='222',profile='default',transport_profile='default')
+    protected={}
+    for state in ('pending','unknown','delivered'):
+        item=dl.source_obligation(source,state,'Synthetic result',{})
+        protected[state]=item['obligation_id']
+        if state!='pending':assert dl.begin_source_send(item['obligation_id'])
+        if state=='delivered':assert dl.acknowledge_source_send(item['obligation_id'],'native-ack')
+    with dl._connect() as conn:
+        conn.execute('UPDATE delivery_obligations SET updated_at=0')
+        conn.commit()
+    for number in range(dl._MAX_ROWS+25):
+        _record(oid=f'ordinary-{number}')
+    for state,oid in protected.items():
+        assert _row(oid) is not None, f'{state} source custody was pruned'
+        assert dl.source_obligation(source,state,'Synthetic result',{})['state']==state
+    assert dl.source_delivery_receipt(source,'delivered')['native_message_id']=='native-ack'
+    assert not dl.begin_source_send(protected['unknown'])

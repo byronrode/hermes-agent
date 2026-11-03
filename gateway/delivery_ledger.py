@@ -206,6 +206,67 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(delivery_obligations)')}
+    for name in ('source_binding','native_message_id'):
+        if name not in columns:
+            add_column_if_missing(conn,'delivery_obligations',name,name+' TEXT')
+
+
+def source_obligation(source, identity, content, metadata):
+    """Same outbox, strict immutable source binding; never reset an attempted send."""
+    import json
+    binding = json.dumps(dict(source=source,identity=identity,metadata=metadata,
+        content_sha256=hashlib.sha256(content.encode()).hexdigest()),sort_keys=True)
+    oid = compute_obligation_id(source['session_key'],identity,source['run_id'])
+    now, (pid, started) = time.time(), _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute("""INSERT OR IGNORE INTO delivery_obligations
+            (obligation_id,session_key,platform,chat_id,thread_id,content,state,attempts,
+             created_at,updated_at,owner_pid,owner_started_at,adapter_profile,source_binding)
+            VALUES (?,?,?,?,?,?,'pending',0,?,?,?,?,?,?)""",
+            (oid,source['session_key'],source['platform'],source['channel_id'],source['thread_id'] or None,
+             '',now,now,pid,started,source['transport_profile'],binding))
+        row = conn.execute('SELECT state,source_binding,content,native_message_id FROM delivery_obligations '
+            'WHERE obligation_id=?',(oid,)).fetchone()
+        if row[1] != binding or row[2] != '':
+            raise ValueError('source_delivery_binding_changed')
+        return dict(obligation_id=oid,state=row[0],native_message_id=row[3])
+
+
+def begin_source_send(oid):
+    # Unknown BEFORE await: a crash or lost ACK must not cause blind redelivery.
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute("UPDATE delivery_obligations SET state='unknown',updated_at=?,owner_pid=?,owner_started_at=? "
+            "WHERE obligation_id=? AND source_binding IS NOT NULL AND state='pending'",(time.time(),pid,started,oid))
+        return bool(cur.rowcount)
+
+
+def acknowledge_source_send(oid, native_message_id):
+    if not isinstance(native_message_id,str) or not native_message_id:
+        raise ValueError('native_source_ack_required')
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute("UPDATE delivery_obligations SET state='delivered',native_message_id=?,updated_at=? "
+            "WHERE obligation_id=? AND source_binding IS NOT NULL AND state='unknown' "
+            "AND owner_pid=? AND owner_started_at IS ?",
+            (native_message_id,time.time(),oid,pid,started))
+        return bool(cur.rowcount)
+
+
+def source_delivery_receipt(source, identity):
+    import json
+    oid = compute_obligation_id(source['session_key'],identity,source['run_id'])
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute('SELECT state,source_binding,native_message_id FROM delivery_obligations '
+            'WHERE obligation_id=?',(oid,)).fetchone()
+        if not row or row[0] != 'delivered' or not row[2]:
+            return None
+        binding = json.loads(row[1] or '{}')
+        if binding.get('source') != source or binding.get('identity') != identity:
+            raise ValueError('source_delivery_receipt_changed')
+        return dict(state='delivered',obligation_id=oid,native_message_id=row[2],
+            accepted_source=source,identity=identity,metadata=binding['metadata'],content_sha256=binding['content_sha256'])
 
 
 def _transaction():
@@ -393,7 +454,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile, last_error, updated_at
                FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
+               WHERE state IN ('pending', 'attempting', 'failed') AND source_binding IS NULL"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
@@ -538,12 +599,14 @@ def _prune_unlocked(conn, now: float) -> None:
     """Retention DELETEs on the caller's open connection — must run inside the caller's transaction."""
     conn.execute(
         """DELETE FROM delivery_obligations
-           WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
-    total = conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
+           WHERE state IN ('delivered', 'abandoned') AND source_binding IS NULL AND updated_at < ?""", (now - _RETENTION_SECONDS,))
+    # Source-bound custody is not a disposable retry cache. Even a delivered
+    # ACK may still await provider binding; capacity must never erase it.
+    total = conn.execute("SELECT COUNT(*) FROM delivery_obligations WHERE source_binding IS NULL").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
             """DELETE FROM delivery_obligations WHERE obligation_id IN (
-                 SELECT obligation_id FROM delivery_obligations
+                 SELECT obligation_id FROM delivery_obligations WHERE source_binding IS NULL
                  ORDER BY CASE state
                             WHEN 'delivered' THEN 0
                             WHEN 'abandoned' THEN 1

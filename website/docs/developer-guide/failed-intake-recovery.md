@@ -59,3 +59,45 @@ central binding, with unknown ACKs held by their original owner.
 
 Tests use real SDK/HTTP/SQLite and a real process lifetime, with explicitly
 synthetic provider/model/channel transports. They do not establish live delivery.
+
+## Private normal-drain diagnostics
+
+`gateway.source_delivery` writes warning records to the existing private Hermes
+log owner: `source_delivery stage=<fixed-stage> reason=<fixed-reason>
+error_type=<safe-type>`. There is no outbound telemetry, new log/store/service,
+API or config flag. No source/recipient IDs, content, credentials, exception
+messages, tracebacks or arbitrary exception class names are recorded.
+
+Stages identify poll/provider lookup, initial route, producer read and validation,
+route/identity before commit, session resolution, OS append, obligation/send claim,
+route/identity before and after send, send/ACK, receipt read, central binding and
+source consumption. `timeout` distinguishes native timeout exceptions; other
+caught exceptions use `exception` plus a fixed builtin type (unknown types become
+`Error`). Fixed rejection reasons identify missing provider/binder, unavailable
+adapter, changed owner identity, unknown ACK, uncommitted ACK or missing receipt.
+The records do not assert the underlying cause beyond that observed boundary.
+
+Normal queued results and provider skips of already delivered items emit no error.
+Unknown ACK records remain held; repeated inspection never resets or resends them.
+Budgets, authorization, retries, ordering, CAS, ACK and exception handling are
+unchanged. A producer can create an obligation before returning: that row alone
+still does not establish arrival at the normal drain's send stage.
+
+Parent activation uses the normal native source updater and managed default gateway
+restart after merging the exact reviewed source. No Mara helper/plugin change,
+grant, setting, timer or extra instrumentation service is needed. Collect the
+fixed stage/reason from the next genuine incoming source through the existing
+private logs; do not replay or reset an already delivered source to generate one.
+The original operator-recovered Discord result retains its delivered custody and
+central receipt. Installation/tests alone do not establish automatic acceptance.
+
+Verification:14 injected boundary cases fail on the unchanged base; the eight-file
+source/ledger/lease/profile suite passes123 tests. The final expanded SDK/SQLite
+source file passes21 tests, including quiet queued/delivered skips and unchanged
+custody/no-resend checks. Provider/model/send transports are synthetic. No live
+source, delivery or runtime setting was changed for this verification.
+Compact Jev outcome invocation: `hermes -p default jev evaluate --file
+/tmp/source-drain-diagnostic-outcome.json`; advisory receipt retained in the
+owning Hermes context as `source-drain-diagnostic-jev.json` (scope0.86,
+remaining acceptance0.92; not a grant or delivery claim). Input SHA-256:
+`762ca5235cbfbac1aa53daca6cc98c52e4373c5916ddde216fdbeaf9533325be`.

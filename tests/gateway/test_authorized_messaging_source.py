@@ -231,6 +231,103 @@ async def test_only_authorized_native_external_turn_can_bind_and_scope_revokes(t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('boundary,stage,reason,state',[
+    ('poll','poll','exception',None),('provider','provider_lookup','provider_or_binder_unavailable',None),
+    ('route','route_initial','exception',None),('timeout','producer_read','timeout',None),
+    ('malformed','producer_validation','exception',None),
+    ('identity','identity_before_commit','adapter_manager_or_provider_changed',None),
+    ('route_changed','route_before_commit','exception',None),
+    ('adapter','send_eligibility','adapter_unavailable','pending'),
+    ('append','os_append','exception',None),('claim','send_claim','exception','pending'),
+    ('before_send','identity_before_send','gateway_adapter_manager_or_provider_changed','unknown'),
+    ('after_send','identity_after_send','gateway_adapter_manager_or_provider_changed','unknown'),
+    ('send','send','exception','unknown'),('unknown','send_ack','unknown_ack','unknown'),
+    ('ack','acknowledge','ack_not_committed','unknown'),
+    ('bind','central_bind','exception','delivered')])
+async def test_drain_diagnostics_are_sanitized_and_preserve_custody(tmp_path,monkeypatch,caplog,boundary,stage,reason,state):
+    r=rig(tmp_path,monkeypatch)
+    try:
+        source=await execute(r,monkeypatch,current_gateway_source)
+        delivery={'state':'answered','accepted_source':source,'identity':'synthetic-diagnostic',
+            'content':'Synthetic result','metadata':{'delegation_id':'synthetic-diagnostic','source_run_id':source['run_id']},'display_kind':'source_result'}
+        r.provider.read_result=AsyncMock(return_value=delivery)
+        r.provider.bind_gateway_receipt=AsyncMock(return_value=False)
+        r.adapter.send=AsyncMock(return_value=SendResult(success=True,message_id='native-diagnostic'))
+        secret='SECRET-private-prompt-token'
+        error=type('SECRETMaliciousClass',(ValueError,),{})(secret)
+        def fail(*args,**kwargs):raise error
+        if boundary=='poll':monkeypatch.setattr(r.db,'mark_gateway_source_polled',fail)
+        if boundary=='provider':del r.provider.bind_gateway_receipt
+        if boundary=='route':monkeypatch.setattr(r.runner,'_is_user_authorized_for_source',fail)
+        if boundary=='timeout':r.provider.read_result=AsyncMock(side_effect=TimeoutError(secret))
+        if boundary=='malformed':r.provider.read_result=AsyncMock(return_value=dict(delivery,accepted_source={'private':secret}))
+        if boundary=='identity':
+            async def replace(source):
+                r.manager._api_source_providers['synthetic']=SimpleNamespace()
+                return delivery
+            r.provider.read_result=replace
+        if boundary=='route_changed':
+            async def revoke(source):
+                monkeypatch.setattr(r.runner,'_is_user_authorized_for_source',fail)
+                return delivery
+            r.provider.read_result=revoke
+        if boundary=='adapter':r.adapter._running=False
+        if boundary=='append':monkeypatch.setattr(r.db,'append_source_result_delivery',fail)
+        if boundary=='claim':monkeypatch.setattr(ledger,'begin_source_send',fail)
+        if boundary=='before_send':
+            claim=ledger.begin_source_send
+            def stop_after_claim(oid):
+                result=claim(oid);r.runner._running=False
+                return result
+            monkeypatch.setattr(ledger,'begin_source_send',stop_after_claim)
+        if boundary=='after_send':
+            async def stop_after_send(**kwargs):
+                r.runner._running=False
+                return SendResult(success=True,message_id='synthetic-late-ack')
+            r.adapter.send=AsyncMock(side_effect=stop_after_send)
+        if boundary=='send':r.adapter.send=AsyncMock(side_effect=error)
+        if boundary=='unknown':r.adapter.send=AsyncMock(return_value=SendResult(success=False))
+        if boundary=='ack':monkeypatch.setattr(ledger,'acknowledge_source_send',lambda *args:False)
+        if boundary=='bind':r.provider.bind_gateway_receipt=AsyncMock(side_effect=error)
+        await drain_gateway_sources(r.runner)
+        records=[record for record in caplog.records if record.name=='gateway.source_delivery']
+        assert any(f'stage={stage} reason={reason} ' in record.getMessage() for record in records)
+        assert all('SECRET' not in record.getMessage() and not record.exc_info for record in records)
+        assert r.db.pending_gateway_sources()==[source]
+        with ledger._connect() as conn:
+            rows=conn.execute('SELECT state FROM delivery_obligations WHERE source_binding IS NOT NULL').fetchall()
+        assert [row[0] for row in rows]==([] if state is None else [state])
+        if state in ('unknown','delivered'):
+            await drain_gateway_sources(r.runner)
+            assert r.adapter.send.await_count==(0 if boundary=='before_send' else 1)
+            with ledger._connect() as conn:
+                assert conn.execute('SELECT state FROM delivery_obligations WHERE source_binding IS NOT NULL').fetchone()[0]==state
+    finally:
+        r.db.close();await r.adapter._client.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_and_already_delivered_skip_emit_no_error(tmp_path,monkeypatch,caplog):
+    r=rig(tmp_path,monkeypatch)
+    try:
+        source=await execute(r,monkeypatch,current_gateway_source)
+        r.provider.read_result=AsyncMock(return_value={'state':'queued','accepted_source':source})
+        r.provider.bind_gateway_receipt=AsyncMock()
+        r.adapter.send=AsyncMock()
+        await drain_gateway_sources(r.runner)
+        pending=ledger.source_obligation(source,'already-returned','Synthetic result',{})
+        assert ledger.begin_source_send(pending['obligation_id'])
+        assert ledger.acknowledge_source_send(pending['obligation_id'],'synthetic-existing-ack')
+        await drain_gateway_sources(r.runner)
+        assert ledger.source_delivery_receipt(source,'already-returned')['native_message_id']=='synthetic-existing-ack'
+        assert not [record for record in caplog.records if record.name=='gateway.source_delivery']
+        r.adapter.send.assert_not_awaited()
+        assert r.db.pending_gateway_sources()==[source]
+    finally:
+        r.db.close();await r.adapter._client.close()
+
+
+@pytest.mark.asyncio
 async def test_native_ack_restart_unknown_and_late_owner_never_blindly_resend(tmp_path, monkeypatch):
     r=rig(tmp_path,monkeypatch)
     try:

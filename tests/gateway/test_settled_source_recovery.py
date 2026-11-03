@@ -136,7 +136,15 @@ async def test_same_settled_source_after_real_owner_process_exit(tmp_path,persis
                 if not persist:
                     async def foreign(base):return {**source,'session_id':'foreign'}
                     provider.recover_source=foreign
-                    assert (await client.get(path+'/accepted-source',headers=headers)).status==404
+                    rejected=await client.get(path+'/accepted-source',headers=headers)
+                    assert rejected.status==404
+                    assert (await rejected.json())['diagnostic']=={
+                        'phase':'snapshot_validation','reason':'settled_source_snapshot_changed','error_type':'ValueError'}
+                    async def private_failure(base):raise ValueError('private prompt credential material must never be echoed')
+                    provider.recover_source=private_failure
+                    rejected=await client.get(path+'/accepted-source',headers=headers)
+                    assert (await rejected.json())=={'error':'source_unavailable','diagnostic':{
+                        'phase':'snapshot_recovery','reason':'source_read_failed','error_type':'ValueError'}}
                     provider.recover_source=recover
                 receipt=await (await client.post(path+'/source-result',json={},headers=headers)).json()
                 assert receipt['state']=='persisted' and receipt['run_id']==run

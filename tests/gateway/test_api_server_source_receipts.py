@@ -218,3 +218,20 @@ async def test_invalid_source_read_budget_fails_before_producer(owner,budget):
         await asyncio.wait_for(finished.wait(),5)
         assert (await (await client.post(f'/v1/runs/{run}/source-result',json={},headers=headers)).json())['state']=='unavailable'
         provider.read_result.assert_not_called()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('error,reason',[(ValueError('private prompt and credential bytes'),'source_read_failed'),
+                                       (TimeoutError('private provider payload'),'source_read_timeout')])
+async def test_authorized_result_diagnostic_is_phase_bounded_and_never_echoes_provider_text(owner,error,reason):
+    adapter,app,db,finished,provider,registration=owner
+    provider.read_result=AsyncMock(side_effect=error)
+    headers={'Authorization':'Bearer synthetic-api-key','Idempotency-Key':'safe-diagnostic'}
+    async with TestClient(TestServer(app)) as client:
+        run=(await (await client.post('/v1/runs',json={'session_id':'original-session','input':'first status'},headers=headers)).json())['run_id']
+        await asyncio.wait_for(finished.wait(),5)
+        response=await client.post(f'/v1/runs/{run}/source-result',json={},headers=headers)
+        assert response.status==503
+        assert await response.json()=={'state':'unavailable','diagnostic':{'phase':'producer_read','reason':reason,'error_type':type(error).__name__}}
+        unauthorized=await client.get(f'/v1/runs/{run}/accepted-source')
+        assert unauthorized.status==401
+        assert 'diagnostic' not in await unauthorized.json()

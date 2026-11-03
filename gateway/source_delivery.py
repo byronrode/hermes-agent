@@ -1,5 +1,6 @@
 """Consume accepted messaging sources through existing adapters and delivery obligations."""
 import asyncio
+from contextvars import copy_context
 import time
 from types import SimpleNamespace
 from gateway.config import Platform
@@ -53,8 +54,9 @@ async def drain_gateway_sources(runner):
                 from gateway.source_intake_recovery import retry_failed_intake
                 try:
                     from gateway.platforms.api_server_runs import _submit_api_worker
+                    context = copy_context()
                     work = _submit_api_worker(asyncio.get_running_loop(),
-                        lambda: retry_failed_intake(runner,source['message_id']))
+                        lambda: context.run(retry_failed_intake,runner,source['message_id']))
                     await asyncio.shield(work)
                 except (ValueError,RuntimeError,OSError,KeyError,TypeError):
                     # Unqualified/live/exhausted sources cannot be retried;

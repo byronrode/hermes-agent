@@ -1,6 +1,6 @@
 """Owner-only retry of a persisted, qualified failed intake, without a model turn."""
 import asyncio
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 import hashlib
 import json
 import os
@@ -198,8 +198,9 @@ async def handle_retry(owner, request):
         # The worker and durable PID claim survive a disconnected HTTP caller.
         # Existing API shutdown accounting keeps SessionDB open until it exits.
         from gateway.platforms.api_server_runs import _submit_api_worker
+        context = copy_context()
         work = _submit_api_worker(asyncio.get_running_loop(),
-            lambda: retry_failed_intake(runner,request.match_info['message_id']))
+            lambda: context.run(retry_failed_intake,runner,request.match_info['message_id']))
         return web.json_response(await asyncio.shield(work))
     except (ValueError,RuntimeError,OSError,KeyError,TypeError) as error:
         reason = str(error)

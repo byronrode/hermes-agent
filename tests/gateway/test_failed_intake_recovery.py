@@ -61,7 +61,17 @@ async def fixture(tmp_path, monkeypatch):
     r.provider.retry_gateway_intake=retry
     api=APIServerAdapter(PlatformConfig(enabled=True,extra={'key':'synthetic-operator-key'}))
     api.gateway_runner=r.runner
-    app=web.Application()
+    @web.middleware
+    async def scoped_transport(request,handler):
+        # Synthetic HTTP profile selector; exercise the native context-local
+        # home boundary, not a process-wide environment stand-in for multiplex.
+        from hermes_constants import set_hermes_home_override,reset_hermes_home_override
+        token=set_hermes_home_override(tmp_path/'foreign') if request.headers.get('X-Synthetic-Profile') else None
+        try:
+            return await handler(request)
+        finally:
+            if token is not None:reset_hermes_home_override(token)
+    app=web.Application(middlewares=[scoped_transport])
     app.router.add_post('/v1/gateway-sources/{message_id}/retry-intake',api._handle_gateway_intake_retry)
     client=TestClient(TestServer(app));await client.start_server()
     return SimpleNamespace(r=r,source=source,args=args,result_row=result_row,attempts=attempts,client=client,api=api)
@@ -102,6 +112,8 @@ async def test_authenticated_failed_intake_exact_replay_restart_and_current_perm
             monkeypatch.setenv('HERMES_HOME',str(tmp_path/'foreign'))
             assert (await f.client.post(url,headers=headers,json={})).status==409
             monkeypatch.setenv('HERMES_HOME',str(tmp_path))
+            assert (await f.client.post(url,headers=headers,json={})).status==200
+            assert (await f.client.post(url,headers=dict(headers,**{'X-Synthetic-Profile':'foreign'}),json={})).status==409
             assert (await f.client.post(url,headers=headers,json={})).status==200
             f.r.db._execute_write(lambda conn:conn.execute('UPDATE messages SET tool_calls=? WHERE role=?',
                 (json.dumps([{'id':'original-call','function':{'name':'synthetic_intake',

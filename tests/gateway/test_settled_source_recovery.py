@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -52,12 +53,24 @@ async def seed(root,persist,mode=None):
     agent.session_prompt_tokens=agent.session_completion_tokens=agent.session_total_tokens=0
     agent.run_conversation.return_value={'final_response':'Synthetic internal settled result'}
     if mode=='failed':agent.run_conversation.side_effect=RuntimeError('Synthetic failed model')
+    started,finish=threading.Event(),threading.Event()
+    if mode=='early':
+        def conversation(**kwargs):
+            started.set()
+            if not finish.wait(30):raise RuntimeError('Synthetic test did not release original run')
+            return {'final_response':'Synthetic internal settled result'}
+        agent.run_conversation.side_effect=conversation
     headers={'Authorization':'Bearer synthetic-api-key','Idempotency-Key':'original-source'}
     try:
         with patch.object(adapter,'_create_agent',return_value=agent),patch('hermes_cli.plugins.get_plugin_manager',return_value=manager):
             async with TestClient(TestServer(app)) as client:
                 response=await client.post('/v1/runs',json={'session_id':'original-session','input':'unqualified fixture' if mode=='unqualified' else 'qualified internal fixture'},headers=headers)
                 run=(await response.json())['run_id']
+                if mode=='early':
+                    assert await asyncio.to_thread(started.wait,5)
+                    print('RUNNING '+run,flush=True)
+                    await asyncio.to_thread(sys.stdin.readline)
+                    finish.set()
                 task=adapter._active_run_tasks.get(run)
                 if task:await task
                 source_reply=await client.get(f'/v1/runs/{run}/accepted-source',headers=headers)
@@ -177,6 +190,62 @@ async def test_unqualified_or_failed_original_cannot_be_retroqualified_after_own
     finally:
         if process.poll() is None:
             process.stdin.write('exit\n');process.stdin.flush()
+            await asyncio.wait_for(asyncio.to_thread(process.wait),10)
+        for stream in (process.stdin,process.stdout,process.stderr):stream.close()
+        if lease:lease.dispose()
+        if adapter:adapter._run_idempotency_store.close();adapter._response_store.close()
+        if db:db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('early_route',['accepted-source','source-result'])
+async def test_early_nonterminal_read_refreshes_in_same_replacement_after_original_exit(tmp_path,early_route):
+    process=subprocess.Popen([sys.executable,str(Path(__file__).resolve()),str(tmp_path),'0','early'],
+        stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    adapter=db=lease=None
+    try:
+        line=await asyncio.wait_for(asyncio.to_thread(process.stdout.readline),15)
+        assert line.startswith('RUNNING '),process.stderr.read() if not line else line
+        run=line.strip().split()[1]
+        adapter,db,provider,manager,lease,app=setup(tmp_path)
+        recoveries=[]
+        async def recover(base):
+            recoveries.append(base)
+            return json.loads((tmp_path/'original.json').read_text())['source']
+        async def read(source):return json.loads((tmp_path/'original.json').read_text())['delivery']
+        provider.recover_source=recover;provider.read_result=read
+        headers={'Authorization':'Bearer synthetic-api-key'}
+        with patch.object(adapter,'_create_agent',side_effect=AssertionError('No duplicate execution')) as launch, \
+             patch('hermes_cli.plugins.get_plugin_manager',return_value=manager):
+            async with TestClient(TestServer(app)) as client:
+                path=f'/v1/runs/{run}'
+                early=(await client.get(path+'/accepted-source',headers=headers) if early_route=='accepted-source'
+                       else await client.post(path+'/source-result',json={},headers=headers))
+                assert early.status==(404 if early_route=='accepted-source' else 503)
+                assert adapter._run_statuses[run]['status']=='running'
+                assert not recoveries
+                process.stdin.write('finish\n');process.stdin.flush()
+                assert await asyncio.wait_for(asyncio.to_thread(process.stdout.readline),10)=='READY\n'
+                original=json.loads((tmp_path/'original.json').read_text())
+                assert original['run_id']==run
+                process.stdin.write('exit\n');process.stdin.flush()
+                assert await asyncio.wait_for(asyncio.to_thread(process.wait),10)==0
+                # This is the SAME replacement adapter/cache, not another restart.
+                assert adapter._run_statuses[run]['status']=='running'
+                assert (await client.get(path+'/accepted-source',headers={'Authorization':'Bearer foreign'})).status==401
+                restored=await client.get(path+'/accepted-source',headers=headers)
+                assert restored.status==200 and await restored.json()==original['source']
+                assert adapter._run_statuses[run]['status']=='completed'
+                receipt=await (await client.post(path+'/source-result',json={},headers=headers)).json()
+                assert receipt['state']=='persisted' and receipt['run_id']==run
+                repeated=await (await client.post(path+'/source-result',json={},headers=headers)).json()
+                assert repeated==receipt
+                rows=[m for m in db.get_messages('original-session') if m.get('display_kind')=='fixture_result']
+                assert len(rows)==1 and rows[0]['id']==receipt['message_id']
+                launch.assert_not_called()
+    finally:
+        if process.poll() is None:
+            process.stdin.write('exit\nexit\n');process.stdin.flush()
             await asyncio.wait_for(asyncio.to_thread(process.wait),10)
         for stream in (process.stdin,process.stdout,process.stderr):stream.close()
         if lease:lease.dispose()

@@ -633,6 +633,10 @@ The dispatched tool goes through the normal approval, redaction, and budget pipe
 
 ### Accepted API source providers
 
+The same profile-local registration can optionally consume native messaging
+sources. See [post-authorization messaging sources](../accepted-messaging-source.md).
+This does not change `pre_gateway_dispatch`, which remains pre-authorization.
+
 `ctx.register_api_source_provider(provider)` registers a profile-local, unloadable
 integration selected explicitly by `platforms.api_server.extra.accepted_source_provider`.
 The provider has `name`, synchronous `qualify(*, message, profile)` and async

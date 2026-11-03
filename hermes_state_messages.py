@@ -130,6 +130,69 @@ def _stale_holder(row, now: float) -> bool:
 class SessionMessagesMixin:
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe."""
 
+    def bind_gateway_source_turn(self, session_id, candidate, turn_id, qualification, *, admit=True):
+        """Bind only this gateway-stamped native user row; replay cannot mint a new turn."""
+        def write(conn):
+            session = conn.execute('SELECT source FROM sessions WHERE id=?',(session_id,)).fetchone()
+            if not session or session[0] != 'discord':
+                return None
+            # Exact native event lookup across session reset/compression. A
+            # replay cannot acquire a new admission merely by changing session.
+            rows = conn.execute("SELECT m.id,m.display_metadata FROM messages m JOIN sessions s ON s.id=m.session_id "
+                "WHERE s.source='discord' AND m.role='user' AND m.platform_message_id=? "
+                "AND json_extract(m.display_metadata,'$.gateway_source_candidate.run_id')=?",
+                (candidate['message_id'],candidate['run_id'])).fetchall()
+            if len(rows) != 1:
+                return None
+            meta = json.loads(rows[0][1] or '{}')
+            if meta.get('gateway_source_candidate') != candidate:
+                return None
+            source = dict(candidate,turn_id=turn_id,**qualification)
+            if meta.get('gateway_accepted_source') not in (None,source):
+                return None
+            if not admit:
+                return source
+            meta['gateway_accepted_source'] = source
+            conn.execute('UPDATE messages SET display_metadata=? WHERE id=?',
+                (json.dumps(meta,sort_keys=True),rows[0][0]))
+            return source
+        return self._execute_write(write)
+
+    def pending_gateway_sources(self):
+        """Metadata-only projection of opted-in accepted sources, never channel history."""
+        accepted = _sql_json_extract('m.display_metadata','$.gateway_accepted_source')
+        consumed = _sql_json_extract('m.display_metadata','$.gateway_source_consumed')
+        rows = self._read_all("SELECT m.display_metadata FROM messages m JOIN sessions s ON s.id=m.session_id "
+            f"WHERE s.source='discord' AND m.role='user' AND {accepted} IS NOT NULL "
+            f"AND coalesce({consumed},0)=0 ORDER BY m.id LIMIT 100")
+        return [json.loads(row[0])['gateway_accepted_source'] for row in rows]
+
+    def gateway_source_row(self, source):
+        session = self.get_session(source['session_id'])
+        if not session or session.get('source') != source['platform']:
+            raise ValueError('gateway_source_session_changed')
+        rows = self._read_all("SELECT m.id,m.display_metadata FROM messages m JOIN sessions s ON s.id=m.session_id "
+            "WHERE s.source='discord' AND m.role='user' AND m.platform_message_id=? "
+            "AND json_extract(m.display_metadata,'$.gateway_accepted_source.run_id')=?",
+            (source['message_id'],source['run_id']))
+        if len(rows) != 1 or json.loads(rows[0][1] or '{}').get('gateway_accepted_source') != source:
+            raise ValueError('gateway_source_custody_changed')
+        return rows[0][0]
+
+    def consume_gateway_source(self, source):
+        row_id = self.gateway_source_row(source)
+        def write(conn):
+            rows = conn.execute('SELECT id,display_metadata FROM messages WHERE id=?',(row_id,)).fetchall()
+            if len(rows) != 1:
+                raise ValueError('gateway_source_custody_changed')
+            meta = json.loads(rows[0][1] or '{}')
+            if meta.get('gateway_accepted_source') != source:
+                raise ValueError('gateway_source_custody_changed')
+            meta['gateway_source_consumed'] = True
+            conn.execute('UPDATE messages SET display_metadata=? WHERE id=?',
+                (json.dumps(meta,sort_keys=True),rows[0][0]))
+        self._execute_write(write)
+
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
         """Advance the peer's conversation generation past a boundary, in the txn that writes it. Only
         ``_RESET_END_REASONS`` count (compression continues one conversation). Never derived from session

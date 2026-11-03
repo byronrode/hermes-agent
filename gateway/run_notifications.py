@@ -1890,6 +1890,8 @@ class GatewayNotificationsMixin:
                     await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
+                from gateway.source_delivery import drain_gateway_sources
+                await drain_gateway_sources(self)
                 # Process completions remain owned by their per-process watchers.
                 requeue = []
                 async_events = []

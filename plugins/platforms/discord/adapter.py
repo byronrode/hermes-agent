@@ -1029,6 +1029,34 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return preview.text
         return _format_discord_markdown_link(preview.text, preview.url)
 
+    def source_event_identity(self, event):
+        """Native SDK provenance only; public event metadata cannot mint a source."""
+        message = event.raw_message
+        target = getattr(event,'_gateway_source_native_target',None)
+        if (getattr(event,'_gateway_source_external',False) is not True
+                or getattr(event,'_gateway_source_text_sha256',None) != hashlib.sha256(event.text.encode()).hexdigest()
+                or not isinstance(message, discord.Message) or self._client is None
+                or message._state is not self._client._connection or message.author.bot
+                or getattr(target,'_state',None) is not self._client._connection
+                or str(getattr(target,'id','')) != str(event.source.chat_id)
+                or str(message.id) != str(event.message_id)
+                or str(message.author.id) != str(event.source.user_id)
+                or str(getattr(message.guild,'id','') or '') != str(event.source.scope_id or '')
+                or str(message.channel.id) not in {str(event.source.chat_id),str(event.source.parent_chat_id)}):
+            return None
+        if target is not message.channel:
+            if (not isinstance(target,discord.Thread) or target.parent_id != message.channel.id
+                    or getattr(target.guild,'id',None) != getattr(message.guild,'id',None)):
+                return None
+        if isinstance(target,discord.Thread) and str(event.source.thread_id) != str(target.id):
+            return None
+        if isinstance(target,discord.Thread) and str(event.source.parent_chat_id) != str(target.parent_id):
+            return None
+        if not isinstance(target,discord.Thread) and event.source.thread_id not in (None,''):
+            return None
+        return {'original_channel_id':str(message.channel.id),
+                'native_message_sha256':hashlib.sha256(message.content.encode()).hexdigest()}
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
@@ -6144,6 +6172,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
             channel_context=_channel_context,
         )
+        event._gateway_source_native_target = effective_channel
+        event._gateway_source_external = not recovered
+        event._gateway_source_text_sha256 = hashlib.sha256(event.text.encode()).hexdigest()
         if (
             getattr(getattr(message, "author", None), "bot", False)
             and self._is_bot_tag_debounce_continuation(message)

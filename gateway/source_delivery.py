@@ -9,6 +9,7 @@ from gateway.session import SessionSource
 from gateway import delivery_ledger as ledger
 
 logger = logging.getLogger(__name__)
+_DRAIN_WAIT_SECONDS = 30
 
 
 def _diagnostic(stage, reason, error=None):
@@ -38,6 +39,22 @@ def _source_route(runner, db, source):
 
 
 async def drain_gateway_sources(runner):
+    # Consumer cancellation cannot kill a provider's executor thread. Keep the
+    # complete validated delivery transaction owned until it actually settles.
+    task = getattr(runner, '_source_drain_task', None)
+    if task is None or task.done():
+        if task is not None:
+            runner._source_drain_task = None
+            task.result()  # observe unexpected failures; never cache a result
+        task = asyncio.create_task(_drain_gateway_sources(runner))
+        runner._source_drain_task = task
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=_DRAIN_WAIT_SECONDS)
+    except TimeoutError:
+        _diagnostic('drain_wait', 'in_flight', TimeoutError())
+
+
+async def _drain_gateway_sources(runner):
     from hermes_cli.plugins import get_plugin_manager
     if getattr(runner,'_primary_profile_name',None) != 'default' or not getattr(runner,'_session_db',None):
         return
@@ -79,15 +96,22 @@ async def drain_gateway_sources(runner):
                     pass
             from gateway.platforms.api_server_source_receipts import _delivery
             stage = 'producer_read'
-            result = await asyncio.wait_for(provider.read_result(source),timeout=min(
-                30,max(0.1,float(getattr(provider,'read_timeout_seconds',3.5)))))
+            read = asyncio.create_task(provider.read_result(source))
+            try:
+                result = await asyncio.wait_for(asyncio.shield(read), timeout=min(
+                    30,max(0.1,float(getattr(provider,'read_timeout_seconds',3.5)))))
+            except TimeoutError:
+                _diagnostic(stage,'timeout',TimeoutError())
+                # Retain the SAME operation, not a late-result cache. Its fresh
+                # validation and the remaining commit/ACK checks still execute.
+                result = await read
             stage = 'producer_validation'
             delivery = _delivery(result,source)
             if delivery is None:
                 continue
             stage = 'route_before_commit'
             _, live = _source_route(runner,db,source)
-            if (live is not adapter or get_plugin_manager() is not manager
+            if (not getattr(runner,'_running',False) or live is not adapter or get_plugin_manager() is not manager
                     or manager._api_source_providers.get(source['provider']) is not provider):
                 _diagnostic('identity_before_commit','adapter_manager_or_provider_changed')
                 continue
@@ -139,7 +163,7 @@ async def drain_gateway_sources(runner):
             if receipt:
                 receipt['message_id'] = row
                 stage = 'central_bind'
-                consumed = await asyncio.wait_for(consume(source,receipt),timeout=30)
+                consumed = await consume(source,receipt)
                 if consumed is not False:  # a qualified interim notice keeps the final obligation open
                     stage = 'source_consume'
                     await asyncio.to_thread(db.consume_gateway_source,source)

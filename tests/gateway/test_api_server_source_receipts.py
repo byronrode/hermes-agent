@@ -235,3 +235,23 @@ async def test_authorized_result_diagnostic_is_phase_bounded_and_never_echoes_pr
         unauthorized=await client.get(f'/v1/runs/{run}/accepted-source')
         assert unauthorized.status==401
         assert 'diagnostic' not in await unauthorized.json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('result', [None, [], 'private malformed provider output'])
+@pytest.mark.parametrize('protocol', [None, 'per_intent_v1'])
+async def test_non_dictionary_provider_result_keeps_bounded_json_failure(owner,result,protocol):
+    adapter,app,db,finished,provider,registration=owner
+    provider.source_result_protocol=protocol
+    provider.qualify=lambda **kwargs: {'intent':'mara_request','subject':'status'}
+    provider.result=result
+    headers={'Authorization':'Bearer synthetic-api-key','Idempotency-Key':'malformed-result'}
+    async with TestClient(TestServer(app)) as client:
+        admitted=await client.post('/v1/runs',json={'session_id':'original-session','input':'first status'},headers=headers)
+        run=(await admitted.json())['run_id']
+        await asyncio.wait_for(finished.wait(),5)
+        response=await client.post(f'/v1/runs/{run}/source-result',json={},headers=headers)
+        assert response.status==503
+        assert await response.json()=={'state':'unavailable','diagnostic':{
+            'phase':'producer_validation','reason':'source_binding_mismatch','error_type':'ValueError'}}
+        assert not [row for row in db.get_messages('original-session') if row.get('display_kind')=='external_result']

@@ -246,8 +246,10 @@ async def handle_result(owner, request):
         if source_provider(owner) is not provider or source != revalidate_source(owner, request, scope, run_id, snapshot=source):
             raise ValueError('source_changed')
         multiple=getattr(provider,'source_result_protocol',None)=='per_intent_v1' and source.get('intent')=='mara_request'
-        more=multiple and result.get('more_results') is True
-        if multiple:result={k:v for k,v in result.items() if k!='more_results'}
+        more=False
+        if multiple and isinstance(result,dict):
+            more=result.get('more_results') is True
+            result={k:v for k,v in result.items() if k!='more_results'}
         delivery = _delivery(result, source)
         if delivery is None:
             return web.json_response({'state': result.get('state') if result.get('state') in {'queued','unavailable'} else 'unavailable'})

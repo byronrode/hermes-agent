@@ -43,6 +43,8 @@ async def drain_gateway_sources(runner):
     # complete validated delivery transaction owned until it actually settles.
     task = getattr(runner, '_source_drain_task', None)
     if task is None or task.done():
+        if not getattr(runner, '_running', False):
+            return
         if task is not None:
             runner._source_drain_task = None
             task.result()  # observe unexpected failures; never cache a result
@@ -165,6 +167,9 @@ async def _drain_gateway_sources(runner):
                 stage = 'central_bind'
                 consumed = await consume(source,receipt)
                 if consumed is not False:  # a qualified interim notice keeps the final obligation open
+                    if not getattr(runner, '_running', False):
+                        _diagnostic('source_consume', 'gateway_stopped')
+                        continue
                     stage = 'source_consume'
                     await asyncio.to_thread(db.consume_gateway_source,source)
         except (OSError,ValueError,KeyError,TimeoutError,RuntimeError) as error:

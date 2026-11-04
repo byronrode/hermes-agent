@@ -1471,11 +1471,13 @@ def _unlink_quiet(path: Optional[str]) -> None:
 
 def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]]) -> str:
     """Serialize the store payload to a fsynced temp file next to *jobs_file*; return its path."""
+    from cron.jobs_resource_events import staged_changes
+    changes = staged_changes(jobs_file, jobs)
     fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(
-                {"jobs": jobs, "updated_at": _hermes_now().isoformat()},
+                {"jobs": jobs, "updated_at": _hermes_now().isoformat(), "resource_changes":changes[-512:]},
                 f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())

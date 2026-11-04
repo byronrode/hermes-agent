@@ -1651,6 +1651,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Platform event ingress: authenticated by the target adapter's own verifier,
             # NOT API_SERVER_KEY (external platforms hold no API server key).
             ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
+            ("GET", "/api/resource-events", self._handle_resource_events),
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
@@ -3689,6 +3690,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _job_lookup_or_mutate(self, request: "web.Request", fn, *, notify: bool) -> "web.Response":
         job_id, err = self._cron_request_guard(request, need_job_id=True)
         return err if err else self._job_response(fn, job_id, notify=notify)
+
+    async def _handle_resource_events(self, request):
+        from gateway.platforms.api_server_resource_events import resource_events
+        return await resource_events(self,request)
 
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""

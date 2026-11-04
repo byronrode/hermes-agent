@@ -31,6 +31,7 @@ _EXTEND_RETENTION_BY_RUN = (
 _MIGRATIONS = {
     "accepted_source_json": "TEXT",
     "source_result_json": "TEXT",
+    "activity_json": "TEXT",
     "owner_pid": "INTEGER NOT NULL DEFAULT 0",
     "owner_started": "INTEGER NOT NULL DEFAULT 0",
     "retention_until": "REAL NOT NULL DEFAULT 0",
@@ -154,6 +155,7 @@ class RunIdempotencyStore:
                 ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (scope, key, fingerprint, run_id, encoded, int(owner_pid or 0), int(owner_started or 0),
                  retention_until, now, now, _encode_status(accepted_source) if accepted_source else None))
+            self._append_resource_change(run_id)
             self._conn.commit()
             return "created", _record(run_id, encoded, owner_pid, owner_started, now) | {"status": status}
 
@@ -221,11 +223,38 @@ class RunIdempotencyStore:
         return row is not None
 
     def update_status(self, run_id: str, status: Dict[str, Any]) -> None:
-        with self._lock:
+        with self._immediate_txn():
+            previous=self._conn.execute('SELECT status_json FROM run_idempotency WHERE run_id=?',(run_id,)).fetchone()
+            if previous and previous[0]==_encode_status(status):
+                self._conn.commit()
+                return
             self._conn.execute(
                 "UPDATE run_idempotency SET status_json=?, updated_at=? WHERE run_id=?",
                 (_encode_status(status), time.time(), run_id))
+            self._append_resource_change(run_id)
             self._conn.commit()
+
+    def _append_resource_change(self, run_id):
+        from gateway.platforms.api_server_resource_events import change
+        row=self._conn.execute('SELECT activity_json FROM run_idempotency WHERE run_id=?',(run_id,)).fetchone()
+        if row is None:return
+        events=json.loads(row[0] or '[]')
+        events.append(change('runs',run_id))
+        self._conn.execute('UPDATE run_idempotency SET activity_json=? WHERE run_id=?',
+            (json.dumps(events[-128:]),run_id))
+
+    def resource_changes(self, scope):
+        with self._lock:
+            rows=self._conn.execute('SELECT run_id,activity_json,accepted_source_json FROM run_idempotency WHERE scope=?',(scope,)).fetchall()
+        result=[]
+        for run_id,events,source in rows:
+            source=json.loads(source or '{}')
+            if (source.get('platform','api_server')!='api_server' or source.get('profile')!='default'
+                    or source.get('auth_scope')!=scope or source.get('run_id')!=run_id
+                    or source.get('version')!=1 or not source.get('provider') or not source.get('session_id')
+                    or source.get('intent') not in {'mara_request','role_status'}):continue
+            result.extend(json.loads(events or '[]'))
+        return result
 
     def close(self) -> None:
         with self._lock:

@@ -34,7 +34,7 @@ def interrupted_owner(path, pipe):
     db.close()
 
 
-async def fixture(tmp_path, monkeypatch, encoded_arguments=False):
+async def fixture(tmp_path, monkeypatch, encoded_arguments=False, blocked_phase='canonical_capture'):
     r = rig(tmp_path,monkeypatch)
     sources=[]
     await execute(r,monkeypatch,lambda:sources.append(current_gateway_source()))
@@ -43,7 +43,7 @@ async def fixture(tmp_path, monkeypatch, encoded_arguments=False):
     calls=[{'id':'original-call','function':{'name':'tool_call',
         'arguments':json.dumps({'calls':[{'name':'synthetic_intake','arguments':json.dumps(args) if encoded_arguments else args}]})}}]
     r.db.append_message('source-session','assistant','',tool_calls=calls)
-    result_row=r.db.append_message('source-session','tool',json.dumps(dict(blocked_phase='canonical_capture',
+    result_row=r.db.append_message('source-session','tool',json.dumps(dict(blocked_phase=blocked_phase,
         execution_verified=False,delivery_verified=False)),tool_name='synthetic_intake',tool_call_id='original-call')
     attempts=[]
     def validate():
@@ -85,8 +85,9 @@ async def close(f):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('encoded_arguments', [False, True])
-async def test_authenticated_failed_intake_exact_replay_restart_and_current_permission(tmp_path,monkeypatch,encoded_arguments):
-    f=await fixture(tmp_path,monkeypatch,encoded_arguments)
+@pytest.mark.parametrize('blocked_phase', ['canonical_capture', 'work_context'])
+async def test_authenticated_failed_intake_exact_replay_restart_and_current_permission(tmp_path,monkeypatch,encoded_arguments,blocked_phase):
+    f=await fixture(tmp_path,monkeypatch,encoded_arguments,blocked_phase)
     try:
         url='/v1/gateway-sources/444/retry-intake'
         headers={'Authorization':'Bearer synthetic-operator-key'}

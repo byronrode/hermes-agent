@@ -8,6 +8,7 @@ to match the claim-time fingerprint is not proof of death. Terminal states are i
 from __future__ import annotations
 
 import math
+import hashlib
 import os
 import sqlite3
 import threading
@@ -27,6 +28,7 @@ from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM
 # home.
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
+MAX_RESULT_BYTES = 64 * 1024
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
@@ -86,6 +88,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "ON executions(status, claimed_at DESC, id DESC)"
     )
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
+    add_column_if_missing(conn, "executions", "result_text", "result_text TEXT")
+    add_column_if_missing(conn, "executions", "result_sha256", "result_sha256 TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
@@ -283,19 +287,29 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
+    result_text: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
+    # Bind only a complete bounded display result supplied by this execution's
+    # owner. Historical output files and model-writable notes are not receipts.
+    result_bytes = result_text.encode("utf-8") if isinstance(result_text, str) else b""
+    if not result_bytes or len(result_bytes) > MAX_RESULT_BYTES:
+        result_text, result_hash = None, None
+    else:
+        result_hash = hashlib.sha256(result_bytes).hexdigest()
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?
+                   handoff_started_at=NULL, delivery_outcome=?,
+                   result_text=?, result_sha256=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, delivery_outcome, result_text, result_hash,
+             execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None

@@ -316,3 +316,31 @@ Plugins that load after the adapters connected (install/enable from the CLI, Des
 - [ACP Internals](./acp-internals.md)
 - [Agent Loop Internals](./agent-loop.md)
 - [Messaging Gateway (User Guide)](../user-guide/messaging/index.md)
+
+### Accepted-source drain lifetime
+
+`gateway/source_delivery.py` owns one in-process drain task per gateway runner.
+A periodic caller waits at most30 seconds using a shield; expiration or caller
+cancellation does not cancel the transaction or submit another provider read.
+This matters for providers using executor threads: cancelling their awaiting
+coroutine never stopped the thread. Previously the next tick overlapped it.
+Provider-declared read wait limits still emit sanitized timeout diagnostics; the
+same owned transaction awaits the actual completion rather than abandoning it.
+A later tick joins that task, not a cached result. No cross-poll permission or
+result cache is introduced. An indefinitely stuck operation holds the drain and
+reports `drain_wait/in_flight`; it cannot multiply executor work.
+
+Completion proceeds immediately through normal delivery validation and current
+source authorization, adapter/provider identity, OS commit, unknown-ACK/CAS and
+central binding. Shutdown/revocation before commit denies delivery. Native send
+still has its30-second deadline and unknown ACK remains held without resend.
+Central binding stays owned to completion, preventing a timed-out binder thread
+from overlapping a retry. Durable source/outbox custody survives restart; no
+source, model turn or completed work is reexecuted by this lifetime change.
+
+Regression uses the real SDK/auth/SQLite drain with a genuinely blocked executor
+thread and short test consumer waits. Repeated ticks and caller cancellation
+cannot start a second read; release completes one synthetic native ACK/binding,
+or current authorization revocation denies both. Production activation requires
+normal exact-source native update and managed gateway restart. Tests and the
+original manual recovery do not establish live automatic Discord acceptance.

@@ -173,6 +173,10 @@ class GatewayShutdownMixin:
             return time.monotonic() - self.started_at
 
     # Active-work accounting
+    def _active_source_drain_count(self) -> int:
+        task = getattr(self, "_source_drain_task", None)
+        return int(task is not None and not task.done())
+
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
         return (
@@ -180,6 +184,7 @@ class GatewayShutdownMixin:
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + GatewayShutdownMixin._active_source_drain_count(self)
         )
 
     @staticmethod
@@ -784,10 +789,11 @@ class GatewayShutdownMixin:
 
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
-        """``(agents, cron, api, deferred)`` — the four sources the drain waits on."""
+        """``(agents, cron, api, deferred/source)`` — bounded shutdown work counts."""
         return (
             self._running_agent_count(), self._active_cron_job_count(),
-            self._active_api_run_count(), self._active_deferred_agent_worker_count(),
+            self._active_api_run_count(), self._active_deferred_agent_worker_count()
+            + GatewayShutdownMixin._active_source_drain_count(self),
         )
 
     async def _drain_active_agents(
@@ -1539,6 +1545,8 @@ class GatewayShutdownMixin:
                               "wedged": job["job_id"] in wedged})
         for kind, count in (("api", self._active_api_run_count()), ("deferred", self._active_deferred_agent_worker_count())):
             units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
+        if GatewayShutdownMixin._active_source_drain_count(self):
+            units.append({"kind": "source_delivery", "pid": os.getpid()})
         return units
 
     async def _await_active_work_before_restart(self) -> bool:
@@ -1995,6 +2003,9 @@ class GatewayShutdownMixin:
         _api_live = ctx.api_live
         _api_worker_live = self._active_api_worker_count()
         _deferred_live = ctx.deferred_count()
+        if GatewayShutdownMixin._active_source_drain_count(self):
+            logger.warning("Shutdown phase: source delivery still running; skipping SessionDB close/checkpoint")
+            return
         if _cron_live or _api_live or _api_worker_live or _deferred_live:
             logger.warning(
                 "Shutdown phase: %d cron job(s) / %d API-server run(s) / %d API-server worker(s) / "

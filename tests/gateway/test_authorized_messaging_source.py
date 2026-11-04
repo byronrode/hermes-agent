@@ -484,3 +484,40 @@ async def test_native_sdk_managed_role_mention_is_human_summons_only(tmp_path,mo
         assert not r.adapter._self_is_explicitly_mentioned(message)
     finally:
         r.db.close();await r.adapter._client.close()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('revoked',[False,True])
+async def test_slow_thread_survives_consumer_timeout_without_duplicate_read(tmp_path,monkeypatch,revoked):
+    import threading
+    import gateway.source_delivery as owner
+    r=rig(tmp_path,monkeypatch)
+    release=threading.Event();entered=threading.Event();calls=[]
+    try:
+        source=await execute(r,monkeypatch,current_gateway_source)
+        delivery=dict(state='answered',accepted_source=source,identity='slow-source',content='Synthetic result',
+            metadata=dict(delegation_id='slow-source',source_run_id=source['run_id']),display_kind='source_result')
+        def slow():
+            calls.append(1);entered.set();release.wait(10);return delivery
+        async def read(source):return await asyncio.to_thread(slow)
+        r.provider.read_result=read
+        r.provider.bind_gateway_receipt=AsyncMock(return_value=False)
+        r.adapter.send=AsyncMock(return_value=SendResult(success=True,message_id='slow-ack'))
+        monkeypatch.setattr(owner,'_DRAIN_WAIT_SECONDS',0.02,raising=False)
+        await owner.drain_gateway_sources(r.runner)
+        assert await asyncio.to_thread(entered.wait,5)
+        waiter=asyncio.create_task(owner.drain_gateway_sources(r.runner))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):await waiter
+        await owner.drain_gateway_sources(r.runner)
+        assert len(calls)==1
+        if revoked:monkeypatch.setattr(r.runner,'_is_user_authorized_for_source',lambda *a,**kw:False)
+        release.set()
+        await asyncio.wait_for(asyncio.shield(r.runner._source_drain_task),5)
+        assert r.adapter.send.await_count==(0 if revoked else 1)
+        assert r.provider.bind_gateway_receipt.await_count==(0 if revoked else 1)
+    finally:
+        release.set()
+        task=getattr(r.runner,'_source_drain_task',None)
+        if task:await asyncio.gather(task,return_exceptions=True)
+        r.db.close();await r.adapter._client.close()

@@ -36,6 +36,7 @@ def admission_resolver(owner, *, scope, key, fingerprint, run_id, session_id,
         from gateway.platforms.api_server_source_receipts import read_source
         return read_source(owner, scope, run_id)
     resolve.qualified_source = qualified_source
+    resolve.source_text = lambda: message if resolve() is not None else None
     return resolve
 
 
@@ -50,6 +51,7 @@ def accepted_run_scope(resolve):
         reader = getattr(resolve, 'qualified_source', None)
         return reader() if active and callable(reader) else None
     scoped_resolve.qualified_source = qualified_source
+    scoped_resolve.source_text = lambda: resolve.source_text() if active and callable(getattr(resolve, "source_text", None)) else None
     token = _current.set(scoped_resolve)
     try:
         yield
@@ -88,3 +90,21 @@ def current_accepted_source(*, session_id=None):
         return source
     except (sqlite3.Error, OSError, ValueError, KeyError, OverflowError):
         return None
+
+
+def current_accepted_source_message(*, session_id=None):
+    """Exact live source text for trusted local routing; never HTTP/tool metadata.
+
+    No history lookup, credential, caller-selected message or new registry. The
+    same provider qualification, scope revocation and delegated-child guards as
+    current_accepted_source apply before the owning closure may disclose text.
+    """
+    source=current_accepted_source(session_id=session_id)
+    if source is None:return None
+    resolve=_current.get()
+    reader=getattr(resolve,'source_text',None)
+    try:text=reader() if callable(reader) else None
+    except (sqlite3.Error,OSError,ValueError,KeyError,OverflowError):return None
+    if not isinstance(text,str) or hashlib.sha256(text.encode()).hexdigest()!=source.get('message_sha256'):
+        return None
+    return text

@@ -393,3 +393,39 @@ native admission_source/run reserve/status and cron mutation owners through real
 HTTP into bridge SSE, with disposable stores and synthetic request content only.
 The configured independent outcome receipt is retained privately at existing
 context/native-resource-events-jev.json; it grants no activation or live acceptance.
+
+### Live source intent context and per-intent API returns
+
+The existing accepted API-run owner now offers the trusted in-process getter
+`current_accepted_source_message(session_id=...)`. It reads the exact source text
+from its admission closure only after current provider/source/reservation checks,
+then verifies the immutable source hash. The same scope-exit revocation,
+delegated-child and session/profile guards apply. No HTTP/tool parameter or JSON
+source receipt exposes this text; no history search, credential proxy, registry
+or store is added. This lets a client check requested company context without
+trusting model-provided IDs or retaining copied hook context as authority.
+
+A registered ordinary-request provider may opt into `source_result_protocol =
+"per_intent_v1"`. Its actual qualified results retain distinct immutable identities
+inside the SAME reservation's existing source_result_json slot (maximum20 results).
+Legacy single envelopes are unchanged on identical retry. Additional identities
+are retained in a version2 results map, with the original accepted_source also
+kept at the root for source-metadata compatibility. Default recovery reads the
+first original snapshot; commit compares the exact per-identity envelope. Foreign
+source/scope or changed content under an existing identity is denied. No new
+ledger/database or public result-selection/proof/destination argument is added.
+
+The empty authenticated source-result POST may advance through independently
+ready intents. A transient provider `more_results` flag is removed before pending
+identity comparison/storage and returned only to the consumer; it cannot mutate
+a committed envelope. Existing age, source/provider revalidation, actual OS-row
+commit/readback and auth/profile guards still run. Providers without this protocol
+and role-status responses retain the legacy single-result contract.
+
+Activate this native dependency normally before the matching intake/return
+consumer and managed gateway restart. Preserve v2 maps, source snapshots and OS
+rows. Consumer rollback is supported independently; retain the additive native
+map reader while any v2 reservations need replay rather than blindly downgrading
+that reader, deleting state or reexecuting work. Tests use real native reservations,
+HTTP and SQLite with synthetic company/model transports; they are not live
+business/channel acceptance and do not grant customer actions.

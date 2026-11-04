@@ -245,6 +245,9 @@ async def handle_result(owner, request):
         phase = 'producer_validation'
         if source_provider(owner) is not provider or source != revalidate_source(owner, request, scope, run_id, snapshot=source):
             raise ValueError('source_changed')
+        multiple=getattr(provider,'source_result_protocol',None)=='per_intent_v1' and source.get('intent')=='mara_request'
+        more=multiple and result.get('more_results') is True
+        if multiple:result={k:v for k,v in result.items() if k!='more_results'}
         delivery = _delivery(result, source)
         if delivery is None:
             return web.json_response({'state': result.get('state') if result.get('state') in {'queued','unavailable'} else 'unavailable'})
@@ -253,7 +256,7 @@ async def handle_result(owner, request):
         session = await asyncio.to_thread(db.resolve_resume_session_id, source['session_id']) or source['session_id']
         # Check durable identity BEFORE applying a new-result age limit. Both the
         # reservation's pending slot and the existing transcript survive retries.
-        pending = owner._run_idempotency_store.source_result_for_run(scope, run_id)
+        pending = owner._run_idempotency_store.source_result_for_run(scope, run_id, **({'identity':delivery['identity']} if multiple else {}))
         existing = await asyncio.to_thread(db.get_source_result_delivery, session, delivery['identity'], delivery['display_kind'])
         if pending is not None and pending != delivery:
             raise ValueError('source_result_identity_changed')
@@ -269,7 +272,7 @@ async def handle_result(owner, request):
                     or authored < datetime.fromisoformat(source['accepted_at'])):
                 raise ValueError('stale_first_source_result')
         # Persist first validation before the transcript lease can defer writing.
-        owner._run_idempotency_store.remember_source_result(scope, run_id, source, delivery)
+        owner._run_idempotency_store.remember_source_result(scope, run_id, source, delivery, **({'allow_multiple':True} if multiple else {}))
         if source != revalidate_source(owner, request, scope, run_id, snapshot=source):
             raise ValueError('source_changed_before_delivery')
         row = await asyncio.to_thread(db.append_source_result_delivery, session,
@@ -277,7 +280,7 @@ async def handle_result(owner, request):
         persisted = await asyncio.to_thread(db.get_source_result_delivery, session, delivery['identity'], delivery['display_kind'])
         if persisted is None or persisted['id'] != row or persisted['content'] != delivery['content'] or persisted['metadata'] != delivery['metadata']:
             raise ValueError('delivery_readback_failed')
-        return web.json_response({'state':'persisted','run_id':run_id,'session_id':source['session_id'],'message_id':row})
+        return web.json_response({'state':'persisted','run_id':run_id,'session_id':source['session_id'],'message_id':row,**({'more_results':more} if multiple else {})})
     except _FAILURES as error:
         return web.json_response({'state':'unavailable',
                                   'diagnostic':source_diagnostic(error,phase)}, status=503)

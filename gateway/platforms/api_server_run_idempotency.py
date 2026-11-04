@@ -271,13 +271,17 @@ class RunIdempotencyStore:
         return {"source": json.loads(row[0]), "fingerprint": row[1], "status": json.loads(row[2]),
                 "owner_pid": row[3], "owner_started": row[4]}
 
-    def source_result_for_run(self, scope: str, run_id: str) -> dict | None:
+    def source_result_for_run(self, scope: str, run_id: str, identity: str = None) -> dict | None:
         with self._lock:
             row = self._conn.execute('SELECT source_result_json FROM run_idempotency WHERE scope=? AND run_id=?',
                                      (scope, run_id)).fetchone()
-        return json.loads(row[0]) if row and row[0] else None
+        stored=json.loads(row[0]) if row and row[0] else None
+        if stored and stored.get('version')==2 and isinstance(stored.get('results'),dict):
+            return stored['results'].get(identity) if identity is not None else next(iter(stored['results'].values()),None)
+        if identity is not None and stored and stored.get('identity')!=identity:return None
+        return stored
 
-    def remember_source_result(self, scope: str, run_id: str, source: dict, result: dict) -> None:
+    def remember_source_result(self, scope: str, run_id: str, source: dict, result: dict, *, allow_multiple: bool = False) -> None:
         """First validated result shares the accepted reservation, before a busy transcript defers it."""
         with self._immediate_txn():
             row = self._conn.execute('SELECT accepted_source_json, source_result_json FROM run_idempotency '
@@ -285,9 +289,21 @@ class RunIdempotencyStore:
             original = {k:v for k,v in source.items() if k not in {'owner_pid','owner_started','owner_revision'}}
             if not row or not row[0] or json.loads(row[0]) != original:
                 raise ValueError('Accepted source changed before pending result')
-            if row[1] and json.loads(row[1]) != result:
-                raise ValueError('Source result identity already binds another result')
-            if not row[1]:
-                self._conn.execute('UPDATE run_idempotency SET source_result_json=? WHERE scope=? AND run_id=?',
-                                   (_encode_status(result), scope, run_id))
+            stored=json.loads(row[1]) if row[1] else None
+            if stored==result:
+                self._conn.commit()
+                return
+            if allow_multiple and stored:
+                values=stored['results'] if stored.get('version')==2 else {stored['identity']:stored}
+                prior=values.get(result['identity'])
+                if prior is not None and prior!=result:raise ValueError('Source result identity already binds another result')
+                if any(value.get('accepted_source')!=source for value in values.values()):raise ValueError('Source result source changed')
+                values[result['identity']]=result
+                if len(values)>20:raise ValueError('Source intent result limit exceeded')
+                encoded={'version':2,'accepted_source':source,'results':values}
+            else:
+                if stored is not None and stored!=result:raise ValueError('Source result identity already binds another result')
+                encoded=result
+            self._conn.execute('UPDATE run_idempotency SET source_result_json=? WHERE scope=? AND run_id=?',
+                               (_encode_status(encoded), scope, run_id))
             self._conn.commit()

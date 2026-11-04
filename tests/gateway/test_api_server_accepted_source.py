@@ -140,3 +140,55 @@ async def test_owner_resolver_checks_durable_record_profile_scope_and_restores_n
     finally:
         for store in stores:
             store.close()
+
+@pytest.mark.asyncio
+async def test_exact_source_text_remains_native_revocable_and_provider_qualified(tmp_path):
+    from gateway.platforms.api_server_accepted_source import current_accepted_source_message
+    from agent.delegation_context import delegated_child_context
+    store=RunIdempotencyStore(str(tmp_path/'source.db'))
+    message='Synthetic explicit company work request'
+    status=dict(run_id='run_synthetic',session_id='source-session',created_at=1,status='running')
+    store.reserve('scope','key','fingerprint','run_synthetic',status)
+    owner=SimpleNamespace(_run_idempotency_store=store,_run_owners={'run_synthetic':'scope'})
+    resolve=admission_resolver(owner,scope='scope',key='key',fingerprint='fingerprint',run_id='run_synthetic',
+        session_id='source-session',profile='default',message=message,authenticated=True)
+    # Provider transport substituted; native reservation, resolver and revocation
+    # are real. The connected consumer tests use actual HTTP provider admission.
+    qualified=dict(resolve())
+    resolve.qualified_source=lambda:qualified
+    try:
+        with accepted_run_scope(resolve):
+            assert current_accepted_source_message(session_id='source-session')==message
+            assert current_accepted_source_message(session_id='foreign') is None
+            copied=copy_context()
+            with delegated_child_context('child'):
+                assert current_accepted_source_message() is None
+            qualified['message_sha256']='foreign'
+            assert current_accepted_source_message() is None
+            qualified['message_sha256']=hashlib.sha256(message.encode()).hexdigest()
+            with accepted_run_scope(None):assert current_accepted_source_message() is None
+            assert current_accepted_source_message()==message
+            owner._run_owners.clear()
+            assert current_accepted_source_message() is None
+            owner._run_owners['run_synthetic']='scope'
+        assert copied.run(current_accepted_source_message) is None
+        assert current_accepted_source_message() is None
+    finally:store.close()
+
+
+def test_same_native_reservation_retains_distinct_immutable_intent_results(tmp_path):
+    path=str(tmp_path/'multi.db');store=RunIdempotencyStore(path)
+    source={'run_id':'run_synthetic','session_id':'source'}
+    store.reserve('scope','key','fingerprint','run_synthetic',{'status':'completed'},accepted_source=source)
+    first=dict(accepted_source=source,identity='intent-one',content='Synthetic one')
+    second=dict(accepted_source=source,identity='intent-two',content='Synthetic two')
+    try:
+        store.remember_source_result('scope','run_synthetic',source,first)
+        store.remember_source_result('scope','run_synthetic',source,second,allow_multiple=True)
+        store.close();store=RunIdempotencyStore(path)
+        assert store.source_result_for_run('scope','run_synthetic')==first
+        assert store.source_result_for_run('scope','run_synthetic','intent-two')==second
+        assert store.source_result_for_run('foreign','run_synthetic','intent-two') is None
+        with pytest.raises(ValueError):store.remember_source_result('scope','run_synthetic',source,dict(first,content='changed'),allow_multiple=True)
+        with pytest.raises(ValueError):store.remember_source_result('scope','run_synthetic',dict(source,session_id='foreign'),second,allow_multiple=True)
+    finally:store.close()

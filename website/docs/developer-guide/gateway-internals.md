@@ -344,3 +344,49 @@ cannot start a second read; release completes one synthetic native ACK/binding,
 or current authorization revocation denies both. Production activation requires
 normal exact-source native update and managed gateway restart. Tests and the
 original manual recovery do not establish live automatic Discord acceptance.
+
+### Native resource mutation feed
+
+`GET /api/resource-events` is an authenticated default-profile JSON replay feed
+for the mobile bridge's SSE invalidations. It accepts only an opaque `cursor`.
+No cursor establishes the current high-water mark; normal GET snapshots remain
+authoritative. Each retained change returns only cursor/resource/id. Missing,
+foreign, pruned or reordered cursors return409; unavailable/corrupt durable owners
+return503. Current authentication is checked before and after owner reads.
+Room grants and foreign profile selections cannot use this feed.
+
+Run admission/status invalidations are committed transactionally in each existing
+`run_idempotency` row's bounded `activity_json` metadata (128 changes per run).
+Replay filters the current auth/profile scope and immutable accepted-source
+receipt to owned API assistant/status runs. No prompt, status body, output,
+recipient or source envelope is copied into an invalidation. Idempotent admission
+and unchanged status create no duplicate change. Native registry pruning retains
+its existing policy; lost replay history requires cursor reset.
+
+Cron's existing locked/fsynced atomic `jobs.json` replacement includes bounded
+`resource_changes` metadata (512 changes), generated INSIDE that mutation owner,
+not by a client comparing snapshots. Create/update/pause/delete/scheduler state
+writes share this path. Invalidations include job ID and profile/visibility
+metadata only. Feed delivery rechecks current job visibility, or the last native
+tombstone after deletion. Foreign-profile and workspace/script/context-managed
+jobs are suppressed; these remain owner-managed rather than mobile-readable
+activity. Existing legacy repair and id-less row semantics remain intact; repair
+can invalidate the replay cursor rather than invent continuity.
+
+There is no new database, event graph, service, provider or client history cache.
+These are native journal extensions within the EXISTING authoritative run/cron
+records. Legacy records gain coverage on their next real mutation; installation
+does not fabricate historical events. The mobile bridge combines this native
+cursor with its existing signed-continuity cursor. Per-run SSE, APNs and polling
+remain supported. Activate through the normal exact-source Hermes updater and
+managed gateway restart, then install the dependent mobile bridge. Roll back
+consumers before native source; unknown extension fields can remain in native
+records without replaying jobs/runs. No live activation/send is implied by tests.
+
+Verification for this dependency:225 native registry/API/cron compatibility tests
+pass, including cross-process lock/shrink-merge/ownership behavior; focused
+source-qualification tests also pass. The consumer integration exercises actual
+native admission_source/run reserve/status and cron mutation owners through real
+HTTP into bridge SSE, with disposable stores and synthetic request content only.
+The configured independent outcome receipt is retained privately at existing
+context/native-resource-events-jev.json; it grants no activation or live acceptance.

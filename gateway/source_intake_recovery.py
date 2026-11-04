@@ -73,7 +73,9 @@ def failed_intake(db, message_id, tool_name):
             if prior is None:
                 raise ValueError('unbound_intake_result')
             result = json.loads(message['content'])
-            if (result.get('blocked_phase') != 'canonical_capture'
+            # Context selection precedes capture. Retry it through the same
+            # source/payload custody and current provider-policy checks below.
+            if (result.get('blocked_phase') not in {'work_context', 'canonical_capture'}
                     or result.get('execution_verified') is not False or result.get('delivery_verified') is not False
                     or result.get('items')):
                 raise ValueError('intake_not_failed_before_capture')

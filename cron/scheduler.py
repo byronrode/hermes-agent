@@ -2938,6 +2938,7 @@ class _RunDelivery:
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
+    result_text: Optional[str] = None
 
 
 def _save_compose_deliver(
@@ -2971,6 +2972,7 @@ def _save_compose_deliver(
     ) = _compose_run_delivery(
         job, success=d.success, error=d.error, final_response=final_response,
         output_file=output_file, agent_declared=d.agent_declared)
+    d.result_text = deliver_content
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
     if d.should_deliver and not d.success and job.get("_model_unreachable"):
@@ -3089,7 +3091,8 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
     finish_execution(
-        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome,
+        result_text=d.result_text)
     return True
 
 

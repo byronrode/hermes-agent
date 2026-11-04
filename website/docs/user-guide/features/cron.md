@@ -394,6 +394,13 @@ Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
 ledger is included in quick backups.
 
+Owner-completed attempts also retain the exact composed display result and its
+UTF-8 SHA256 as `result_text` and `result_sha256`, up to 64 KiB. Raw tool output
+is not copied into these fields. Older attempts, oversized results and interrupted
+attempts can remain unbound; never infer their result from a nearby output-file
+timestamp. This binding establishes which execution produced the text, not that
+it was delivered, displayed or read. Existing delivery outcomes remain separate.
+
 Scheduled attempts also record their exact scheduled instant, separately from
 the time they were claimed. If an old `jobs.json` snapshot re-arms an occurrence
 that the retained ledger records as completed, Hermes skips that replay and

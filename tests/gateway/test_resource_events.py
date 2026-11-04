@@ -6,8 +6,28 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient,TestServer
 from cron import jobs
+from cron.jobs_resource_events import resource_changes
 from gateway.platforms.api_server_resource_events import resource_events
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('legacy', [[], {'jobs': {'legacy-job': {'prompt': 'PRIVATE'}}}])
+async def test_resource_endpoint_reads_legacy_cron_without_repair_or_losing_runs(tmp_path, legacy):
+    store=RunIdempotencyStore(str(tmp_path/'runs.db'))
+    owner=SimpleNamespace(_run_idempotency_store=store,_room_grant_token=lambda r:None,
+        _run_idempotency_scope=lambda r:'scope-a',_check_auth=lambda r:None)
+    with jobs.use_cron_store(tmp_path/'legacy'):
+        path=jobs._current_cron_store().jobs_file
+        path.parent.mkdir(parents=True,exist_ok=True)
+        encoded=json.dumps(legacy);path.write_text(encoded)
+        response=await resource_events(owner,SimpleNamespace(query={}))
+        assert response.status==200
+        assert json.loads(response.body)['events']==[]
+        assert path.read_text()==encoded  # Reading does not repair or mutate the store.
+        jobs.create_job(prompt='Synthetic',schedule='every 2h',paused=True)
+        assert resource_changes()  # Normal locked mutation owns new records.
+    store.close()
 
 @pytest.mark.asyncio
 async def test_native_mutations_replay_restart_and_foreign_denial(tmp_path):
@@ -56,13 +76,13 @@ async def test_scope_profile_alternation_and_legacy_cron(tmp_path):
     from gateway.platforms.api_server import _api_request_profile
     with jobs.use_cron_store(tmp_path/'a'):
         a=jobs.create_job(prompt='private-a',schedule='every 2h',paused=True)
-        assert {e['id'] for e in jobs.resource_changes()}=={a['id']}
+        assert {e['id'] for e in resource_changes()}=={a['id']}
     with jobs.use_cron_store(tmp_path/'b'):
-        assert jobs.resource_changes()==[]
+        assert resource_changes()==[]
         b=jobs.create_job(prompt='private-b',schedule='every 2h',paused=True)
-        assert {e['id'] for e in jobs.resource_changes()}=={b['id']}
+        assert {e['id'] for e in resource_changes()}=={b['id']}
     with jobs.use_cron_store(tmp_path/'a'):
-        assert {e['id'] for e in jobs.resource_changes()}=={a['id']}
+        assert {e['id'] for e in resource_changes()}=={a['id']}
     owner=SimpleNamespace(_check_auth=lambda r:None,_room_grant_token=lambda r:None)
     token=_api_request_profile.set('foreign')
     try:assert (await resource_events(owner,SimpleNamespace())).status==403

@@ -365,7 +365,10 @@ its existing policy; lost replay history requires cursor reset.
 
 Cron's existing locked/fsynced atomic `jobs.json` replacement includes bounded
 `resource_changes` metadata (512 changes), generated INSIDE that mutation owner,
-not by a client comparing snapshots. Create/update/pause/delete/scheduler state
+with serialization/replay in `cron/jobs_resource_events.py`, called by the locked
+save path in `cron/jobs.py`, not by a client comparing snapshots. Read-only replay
+accepts legacy bare lists and ID-keyed job collections without repairing them.
+Create/update/pause/delete/scheduler state
 writes share this path. Invalidations include job ID and profile/visibility
 metadata only. Feed delivery rechecks current job visibility, or the last native
 tombstone after deletion. Foreign-profile and workspace/script/context-managed

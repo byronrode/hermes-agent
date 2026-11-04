@@ -1471,25 +1471,8 @@ def _unlink_quiet(path: Optional[str]) -> None:
 
 def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]]) -> str:
     """Serialize the store payload to a fsynced temp file next to *jobs_file*; return its path."""
-    try:
-        previous,_strict=_parse_jobs_file(jobs_file) if jobs_file.exists() else ({},False)
-    except (OSError,ValueError):
-        # Existing save/repair semantics replace corrupt disk state. Rebuild
-        # native changes too: old replay cursors must reset, never silently skip.
-        previous={}
-    if isinstance(previous,list):previous={'jobs':previous}
-    if not isinstance(previous,dict):previous={}
-    raw=previous.get('jobs',[])
-    if isinstance(raw,dict):raw=[dict(v,id=v.get('id',k)) for k,v in raw.items() if isinstance(v,dict)]
-    old={j['id']:j for j in raw if isinstance(j,dict) and j.get('id')}
-    current={j['id']:j for j in jobs if isinstance(j,dict) and j.get('id')}
-    changes=previous.get('resource_changes',[])
-    from gateway.platforms.api_server_resource_events import change
-    for identity in sorted(old.keys() | current.keys()):
-        if old.get(identity)!=current.get(identity):
-            job=current.get(identity) or old[identity]
-            changes.append(change('automations',identity,profile=job.get('profile') or 'default',
-                visible=not any(job.get(k) for k in ('workdir','script','no_agent','context_from','monitor_script','monitor_url'))))
+    from cron.jobs_resource_events import staged_changes
+    changes = staged_changes(jobs_file, jobs)
     fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -3419,18 +3402,3 @@ def clear_drift_alerted(job_id: str) -> None:
     """Clear the drift alert-dedup marker (resolution matches again)."""
     _set_alert_flag(job_id, "drift_alerted", False)
 # ---- END PLUGIN-COMPAT ----
-
-
-def resource_changes():
-    """Read mutation-owned invalidations from this existing profile cron store."""
-    with _jobs_lock():
-        path=_current_cron_store().jobs_file
-        if not path.exists():return []
-        data,_strict=_parse_jobs_file(path)
-        current={j['id']:j for j in data.get('jobs',[]) if isinstance(j,dict) and j.get('id')}
-        latest={e['id']:e for e in data.get('resource_changes',[])}
-        return [e for e in data.get('resource_changes',[]) if e.get('profile') in (None,'','default')
-                and e.get('visible') is True and latest[e['id']].get('visible') is True
-                and latest[e['id']].get('profile') in (None,'','default') and (e['id'] not in current or (
-                    current[e['id']].get('profile') in (None,'','default') and not any(
-                    current[e['id']].get(k) for k in ('workdir','script','no_agent','context_from','monitor_script','monitor_url'))))]

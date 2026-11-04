@@ -38,7 +38,7 @@ async def resource_events(owner,request):
         store=owner._run_idempotency_store
         if not store.durable:raise OSError('durable_owner_unavailable')
         scope=owner._run_idempotency_scope(request)
-        from cron.jobs import resource_changes
+        from cron.jobs_resource_events import resource_changes
         records=resource_changes()+store.resource_changes(scope)
         if len(records)>10000:raise OSError('bounded_feed_unavailable')
         try:cursor,events=replay(records,request.query.get('cursor'),scope)

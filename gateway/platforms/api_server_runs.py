@@ -250,6 +250,9 @@ def _idempotency_capabilities(self, *, store_type) -> dict[str, Any]:
 
 
 def _close_run_state(self) -> None:
+    from gateway.platforms.api_server_source_receipts import defer_source_result_close
+    if defer_source_result_close(self, lambda: _close_run_state(self)):
+        return
     try:
         if getattr(self, "_run_idempotency_store", None) is not None:
             self._run_idempotency_store.close()

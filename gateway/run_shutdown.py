@@ -231,7 +231,7 @@ class GatewayShutdownMixin:
             return 0
 
     def _active_api_worker_count(self) -> int:
-        """API-server executor threads still inside an agent turn (#116535).
+        """API executor threads and retained source-result transactions (#116535).
 
         Module-level, like the cron registry above: the handler-side adapter count is already
         unreachable here (``adapters`` was cleared a phase earlier) and, worse, drops on handler
@@ -240,7 +240,8 @@ class GatewayShutdownMixin:
         """
         try:
             from gateway.platforms.api_server_runs import api_worker_live_count
-            return max(0, int(api_worker_live_count()))
+            from gateway.platforms.api_server_source_receipts import source_result_work_count
+            return max(0, int(api_worker_live_count())) + source_result_work_count()
         except Exception:
             return 0
 

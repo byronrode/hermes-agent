@@ -1,12 +1,14 @@
 """Generic HTTP admission, external owner and durable detached-delivery contracts."""
 import asyncio
 import copy
+import threading
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import make_mocked_request
 import pytest
 import pytest_asyncio
 
@@ -58,6 +60,7 @@ async def owner(tmp_path):
     with patch.object(adapter,'_create_agent',return_value=agent), patch('hermes_cli.plugins.get_plugin_manager',return_value=manager):
         yield adapter,app,db,finished,provider,registration
         await asyncio.gather(*adapter._active_run_tasks.values(),return_exceptions=True)
+        await asyncio.gather(*(entry['task'] for entry in getattr(adapter,'_source_result_transactions',{}).values()),return_exceptions=True)
     registration.dispose()
     adapter._run_idempotency_store.close();adapter._response_store.close();db.close()
 
@@ -104,6 +107,7 @@ async def test_http_admission_is_current_scoped_source_with_external_classificat
 @pytest.mark.asyncio
 async def test_first_validated_result_survives_busy_ageout_exact_retry_and_compression(owner):
     adapter,app,db,finished,provider,registration = owner
+    provider.bind_gateway_receipt=AsyncMock(side_effect=AssertionError('Legacy result must not invoke work binding'))
     headers = {'Authorization':'Bearer synthetic-api-key','Idempotency-Key':'request'}
     async with TestClient(TestServer(app)) as cli:
         admitted = await cli.post('/v1/runs',json={'session_id':'original-session','input':'first status'},headers=headers)
@@ -158,6 +162,7 @@ async def test_first_validated_result_survives_busy_ageout_exact_retry_and_compr
         rows = [m for m in db.get_messages('original-session') if m.get('display_kind')=='external_result']
         assert len(rows)==1 and rows[0]['role']=='assistant'
         assert rows[0]['content']=='Attributed external answer'
+        provider.bind_gateway_receipt.assert_not_called()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('message', ['first status','ambiguous status'])
@@ -255,3 +260,144 @@ async def test_non_dictionary_provider_result_keeps_bounded_json_failure(owner,r
         assert await response.json()=={'state':'unavailable','diagnostic':{
             'phase':'producer_validation','reason':'source_binding_mismatch','error_type':'ValueError'}}
         assert not [row for row in db.get_messages('original-session') if row.get('display_kind')=='external_result']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('interruption',['timeout','cancel','shutdown'])
+async def test_result_transaction_survives_http_lifetime_and_closes_after_binding(owner,monkeypatch,interruption):
+    from gateway.platforms import api_server_source_receipts as receipts
+    from gateway.run_shutdown import GatewayShutdownMixin
+    adapter,app,db,finished,provider,registration=owner
+    headers={'Authorization':'Bearer synthetic-api-key','Idempotency-Key':'retained-result'}
+    provider.source_result_protocol='per_intent_v1'
+    provider.qualify=lambda **kwargs:{'intent':'mara_request','subject':'status'}
+    started=asyncio.Event();binding=asyncio.Event();retries=asyncio.Event()
+    release=threading.Event();bound=asyncio.Event();calls=[];central={};seen=set()
+    loop=asyncio.get_running_loop();auth=adapter._check_auth
+    def check(request):
+        caller=request.headers.get('X-Test-Caller')
+        if caller:
+            seen.add(caller)
+            if len(seen)==2:retries.set()
+        return auth(request)
+    monkeypatch.setattr(adapter,'_check_auth',check)
+    def produce(source):
+        calls.append(source['run_id']);loop.call_soon_threadsafe(started.set)
+        assert release.wait(10),'test did not release producer'
+        now=datetime.now(timezone.utc).isoformat()
+        return dict(state='answered',accepted_source=source,identity='external:retained',
+            content='Useful original-source result',display_kind='external_result',
+            metadata={'delegation_id':'external:retained','source_run_id':source['run_id']},
+            authored_at=now,validated_at=now)
+    async def read(source):return await asyncio.to_thread(produce,source)
+    async def bind(source,receipt):
+        binding.set();await bound.wait()
+        row=db.get_source_result_delivery(source['session_id'],'external:retained','external_result')
+        assert row['id']==receipt['message_id']
+        central[source['run_id']]=row['id']
+    provider.read_result=read;provider.bind_gateway_receipt=bind
+    monkeypatch.setattr(receipts,'source_read_budget',lambda provider:0.05)
+    async with TestClient(TestServer(app)) as client:
+        run=(await (await client.post('/v1/runs',json={'session_id':'original-session','input':'first status'},headers=headers)).json())['run_id']
+        await asyncio.wait_for(finished.wait(),5)
+        path=f'/v1/runs/{run}/source-result'
+        request=make_mocked_request('POST',path,headers=headers,match_info={'run_id':run})
+        request._read_bytes=b'{}'
+        first=asyncio.create_task(adapter._handle_run_source_result(request))
+        try:
+            await asyncio.wait_for(started.wait(),5)
+            if interruption=='cancel':
+                first.cancel()
+                with pytest.raises(asyncio.CancelledError):await first
+            else:
+                assert (await first).status==503
+            assert adapter.active_agent_work_count()==1
+            assert GatewayShutdownMixin._active_api_worker_count(SimpleNamespace())>=1
+            if interruption=='shutdown':
+                await adapter.disconnect()
+                assert not adapter._session_db_cache_closed
+                assert adapter._run_idempotency_store.accepted_source_for_run(adapter._run_owners[run],run)
+            else:
+                monkeypatch.setattr(receipts,'source_read_budget',lambda provider:30)
+                pending=[asyncio.create_task(client.post(path,json={},headers={**headers,'X-Test-Caller':str(i)})) for i in range(2)]
+                await asyncio.wait_for(retries.wait(),5)
+                assert calls==[run]
+            release.set()
+            await asyncio.wait_for(binding.wait(),5)
+            assert adapter.active_agent_work_count()==1
+            assert run not in central
+            bound.set()
+            if interruption=='shutdown':
+                task=next(iter(adapter._source_result_transactions.values()))['task']
+                assert (await task)[1]==200
+                await asyncio.sleep(0)  # run the registered resource-close callbacks
+                assert adapter._session_db_cache_closed
+            else:
+                responses=await asyncio.gather(*pending)
+                assert [response.status for response in responses]==[200,200]
+                payloads=await asyncio.gather(*(response.json() for response in responses))
+                assert payloads[0]['message_id']==payloads[1]['message_id']==central[run]
+            rows=[row for row in db.get_messages('original-session') if row.get('display_kind')=='external_result']
+            assert len(rows)==1 and rows[0]['id']==central[run]
+            assert calls==[run]
+            assert adapter.active_agent_work_count()==0
+        finally:
+            release.set();bound.set()
+            if not first.done():await first
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('revoke',['owner','provider',None])
+async def test_retained_result_revalidates_authority_and_advances_independent_intents(owner,monkeypatch,revoke):
+    from gateway.platforms import api_server_source_receipts as receipts
+    adapter,app,db,finished,provider,registration=owner
+    provider.source_result_protocol='per_intent_v1'
+    provider.qualify=lambda **kwargs:{'intent':'mara_request','subject':'status'}
+    release=threading.Event();started=asyncio.Event();loop=asyncio.get_running_loop()
+    calls=[];central={};item=[1];at=datetime.now(timezone.utc).isoformat()
+    def produce(source):
+        calls.append(item[0]);loop.call_soon_threadsafe(started.set)
+        assert release.wait(10)
+        identity=f'external:item{item[0]}'
+        return dict(state='answered',accepted_source=source,identity=identity,
+            content=f'Independent result {item[0]}',display_kind='external_result',more_results=item[0]==1,
+            metadata={'delegation_id':identity,'source_run_id':source['run_id']},authored_at=at,validated_at=at)
+    async def read(source):return await asyncio.to_thread(produce,source)
+    async def bind(source,receipt):central[item[0]]=receipt['message_id']
+    provider.read_result=read;provider.bind_gateway_receipt=bind
+    monkeypatch.setattr(receipts,'source_read_budget',lambda provider:0.05)
+    headers={'Authorization':'Bearer synthetic-api-key','Idempotency-Key':'independent-results'}
+    async with TestClient(TestServer(app)) as client:
+        run=(await (await client.post('/v1/runs',json={'session_id':'original-session','input':'first status'},headers=headers)).json())['run_id']
+        await asyncio.wait_for(finished.wait(),5)
+        at=datetime.now(timezone.utc).isoformat()
+        path=f'/v1/runs/{run}/source-result'
+        try:
+            first=await client.post(path,json={},headers=headers)
+            assert first.status==503
+            await asyncio.wait_for(started.wait(),5)
+            task=next(iter(adapter._source_result_transactions.values()))['task']
+            if revoke=='owner':adapter._run_owners[run]='revoked-owner'
+            if revoke=='provider':registration.dispose()
+            release.set()
+            payload,status=await asyncio.wait_for(asyncio.shield(task),5)
+            if revoke:
+                assert status==503 and payload['state']=='unavailable'
+                assert not central
+                assert not [row for row in db.get_messages('original-session') if row.get('display_kind')=='external_result']
+            else:
+                monkeypatch.setattr(receipts,'source_read_budget',lambda provider:30)
+                response=await client.post(path,json={},headers=headers)
+                first=await response.json()
+                assert response.status==200 and first['more_results'] is True
+                assert calls==[1] and first['message_id']==central[1]
+                item[0]=2
+                response=await client.post(path,json={},headers=headers)
+                second=await response.json()
+                assert response.status==200 and second['more_results'] is False
+                assert second['message_id']==central[2]!=first['message_id']
+                assert calls==[1,2]
+                repeat=await client.post(path,json={},headers=headers)
+                assert (await repeat.json())['message_id']==second['message_id']
+                assert len([row for row in db.get_messages('original-session') if row.get('display_kind')=='external_result'])==2
+        finally:release.set()

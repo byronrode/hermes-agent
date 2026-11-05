@@ -84,6 +84,42 @@ async def close(f):
 
 
 @pytest.mark.asyncio
+async def test_typed_owner_classification_is_frozen_before_capture(tmp_path, monkeypatch):
+    f = await fixture(tmp_path, monkeypatch, blocked_phase='input_validation')
+    try:
+        f.r.db._execute_write(lambda conn: conn.execute(
+            'UPDATE messages SET content=? WHERE id=?', (json.dumps(dict(
+                blocked_phase='input_validation', recoverability='owner_reclassification_v1',
+                execution_verified=False, delivery_verified=False)), f.result_row)))
+        original = [tuple(row) for row in f.r.db._read_all(
+            'SELECT id,content,tool_calls FROM messages ORDER BY id')]
+        decisions = []
+        def classify():
+            cap = current_intake_recovery()
+            decisions.append(cap['intent_hash'])
+            return {'arguments': {'items': [{'number': 1, 'title': 'Corrected'}]},
+                    'receipt': {'ok': True}}
+        captures = []
+        def retry():
+            cap = current_intake_recovery()
+            captures.append(cap['owner_classification'])
+            if len(captures) == 1:
+                raise RuntimeError('Synthetic lost capture acknowledgement')
+            return {'items': [{'issue_id': 'existing', 'state': 'accepted'}]}
+        f.r.provider.reclassify_gateway_intake = classify
+        f.r.provider.retry_gateway_intake = retry
+        url = '/v1/gateway-sources/444/retry-intake'
+        headers = {'Authorization': 'Bearer synthetic-operator-key'}
+        assert (await f.client.post(url, headers=headers, json={})).status == 409
+        assert (await f.client.post(url, headers=headers, json={})).status == 200
+        assert len(decisions) == 1 and captures[0] == captures[1]
+        assert [tuple(row) for row in f.r.db._read_all(
+            'SELECT id,content,tool_calls FROM messages ORDER BY id')] == original
+    finally:
+        await close(f)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('phase,reason', [
     ('source_authority', 'pre_capture_failure_unproven'),
     ('input_validation', 'intake_reclassification_required'),

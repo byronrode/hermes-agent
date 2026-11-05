@@ -150,6 +150,8 @@ async def test_only_authorized_native_external_turn_can_bind_and_scope_revokes(t
         captured = []
         def inspect():
             source = current_gateway_source();assert source
+            from gateway.accepted_source import current_gateway_source_message
+            assert current_gateway_source_message() == r.event.text
             assert source['turn_id'] == r.turn and source['message_id'] == '444'
             captured.append(copy_context())
             # Exercise the actual bounded native hook worker, not a direct
@@ -175,6 +177,7 @@ async def test_only_authorized_native_external_turn_can_bind_and_scope_revokes(t
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 assert pool.submit(copy_context().run,current_gateway_source).result(timeout=5) is None
+                assert pool.submit(copy_context().run,current_gateway_source_message).result(timeout=5) is None
             from hermes_constants import set_hermes_home_override,reset_hermes_home_override
             token = set_hermes_home_override(tmp_path/'profile-b')
             try:assert current_gateway_source() is None

@@ -8,10 +8,35 @@ declares `gateway_intake_tool`, `validate_gateway_intake_recovery()` and
 Only the gateway owner reconstructs authority: exactly one persisted Discord user
 row with its native candidate and accepted source, one matching stored tool call
 (direct or the native single-call `tool_call` envelope), and its bound tool result.
-The result must explicitly report `canonical_capture` failure, false execution
+The result must explicitly report `work_context` or `canonical_capture` failure, false execution
 and delivery verification, and no returned item receipt. No caller payload or
 source metadata is accepted as authority. Multiple/ambiguous/successful tool
 results and unauthenticated source failures are unavailable.
+
+`source_authority` failures return `pre_capture_failure_unproven`: an accepted
+source does not prove that the failed invocation reached input validation.
+`input_validation` failures return `intake_reclassification_required`: replaying
+the stored arguments cannot correct a classification. Neither refusal invokes
+the provider or changes source consumption, original tool rows or recovery
+metadata. These reasons diagnose a blocked recovery; they do not implement
+native reclassification or authorize operator-supplied corrections.
+
+New providers may mark a genuinely pre-capture validation failure with
+`recoverability: owner_reclassification_v1`. For these failures only, the
+existing recovery operation calls the provider's `reclassify_gateway_intake()`
+under its conversation lease and current source authorization. Its typed
+`OwnerReclassification` result contains fresh `arguments` and a decision
+`receipt`. Hermes freezes that result in the existing source recovery metadata,
+bound to the original intent hash by CAS, before invoking normal capture. A
+retry reuses the frozen decision. Original tool rows remain immutable and the
+operator body remains `{}`. The provider must validate its fresh input contract
+before capture. Hermes supplies no business classification or model choice.
+
+The concrete consumer is Mara's standalone source provider. Its independent Jev
+classification discards stale tool-declared task/work types. Private source text
+can be inspected only through the current native source capability, including
+the lease-bound recovery reader; it is never returned in an operator receipt.
+Unmarked legacy validation failures and unproven authority failures remain closed.
 
 Current source authorization, profile/home, transport owner, provider and source
 policy are rechecked. A native cross-process conversation lease excludes live

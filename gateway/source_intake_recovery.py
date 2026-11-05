@@ -7,15 +7,23 @@ import os
 import threading
 import time
 import uuid
+from typing import TypedDict
 
 from aiohttp import web
 
 _current = ContextVar('gateway_failed_intake_recovery', default=None)
+
+
+class OwnerReclassification(TypedDict):
+    """Fresh provider input and decision receipt; never operator input."""
+    arguments: dict
+    receipt: dict
 _REASONS = frozenset({'qualified_source_required','source_custody_changed','unbound_intake_result',
     'intake_not_failed_before_capture','unique_failed_intake_required','recovery_custody_changed',
     'recovery_payload_changed','gateway_owner_unavailable','intake_recovery_unavailable','source_owner_live',
     'source_owner_or_policy_changed','recovery_evidence_changed','recovery_owner_live',
-    'recovery_attempts_exhausted','recovery_owner_unqualified','no_caller_payload_permitted'})
+    'recovery_attempts_exhausted','recovery_owner_unqualified','no_caller_payload_permitted',
+    'intake_reclassification_required','pre_capture_failure_unproven'})
 
 
 def current_intake_recovery():
@@ -28,6 +36,13 @@ def current_intake_recovery():
 
 def _hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def current_intake_recovery_message(*, session_id=None):
+    evidence = current_intake_recovery()
+    if evidence is None or session_id not in (None, evidence['source']['session_id']):
+        return None
+    return _current.get()['message']()
 
 
 def failed_intake(db, message_id, tool_name):
@@ -73,9 +88,18 @@ def failed_intake(db, message_id, tool_name):
             if prior is None:
                 raise ValueError('unbound_intake_result')
             result = json.loads(message['content'])
+            # An accepted source proves custody, not which code failed. Legacy
+            # authority errors do not prove validation ran before any capture.
+            if result.get('blocked_phase') == 'source_authority':
+                raise ValueError('pre_capture_failure_unproven')
+            # Replaying unchanged invalid arguments cannot correct classification.
+            # Keep this source unconsumed until its native owner can reclassify.
+            if (result.get('blocked_phase') == 'input_validation'
+                    and result.get('recoverability') != 'owner_reclassification_v1'):
+                raise ValueError('intake_reclassification_required')
             # Context selection precedes capture. Retry it through the same
             # source/payload custody and current provider-policy checks below.
-            if (result.get('blocked_phase') not in {'work_context', 'canonical_capture'}
+            if (result.get('blocked_phase') not in {'work_context', 'canonical_capture', 'input_validation'}
                     or result.get('execution_verified') is not False or result.get('delivery_verified') is not False
                     or result.get('items')):
                 raise ValueError('intake_not_failed_before_capture')
@@ -86,6 +110,7 @@ def failed_intake(db, message_id, tool_name):
     evidence = dict(source=source, arguments=prior[2], user_row=row['id'],
         call_row=prior[0], result_row=result_row,
         call_hash=_hash(prior[3]),result_hash=_hash(result_body),user_hash=_hash(row['content']),
+        reclassification_required=json.loads(result_body).get('blocked_phase') == 'input_validation',
         intent_hash=_hash([source,row['content'],prior[0],prior[1],result_row,result_body]))
     return evidence, meta.get('gateway_intake_recovery')
 
@@ -161,7 +186,9 @@ def retry_failed_intake(runner, message_id):
         if not execution['started']:
             raise ValueError('recovery_owner_unqualified')
         scope = dict(active=True,thread=threading.get_ident(),
-            evidence=dict(evidence,recovery_receipt=(prior or {}).get('receipt')),validate=validate)
+            evidence=dict(evidence,recovery_receipt=(prior or {}).get('receipt')),validate=validate,
+            message=lambda: db._read_all('SELECT content FROM messages WHERE id=?',
+                (evidence['user_row'],))[0][0])
         token = _current.set(scope)
         try:
             # Provider validates current company/owner permission even for a
@@ -171,6 +198,24 @@ def retry_failed_intake(runner, message_id):
                 return prior['receipt']
             _cas(db,evidence,prior,execution)
             try:
+                if evidence['reclassification_required']:
+                    decision = (prior or {}).get('classification')
+                    if decision is None:
+                        classify = getattr(provider, 'reclassify_gateway_intake', None)
+                        if not callable(classify):
+                            raise ValueError('intake_reclassification_required')
+                        decision = classify()
+                        validate()
+                        if (not isinstance(decision, dict) or set(decision) != {'arguments', 'receipt'}
+                                or not isinstance(decision['arguments'], dict)
+                                or not isinstance(decision['receipt'], dict)):
+                            raise ValueError('intake_reclassification_required')
+                        decision = json.loads(json.dumps(decision))
+                    updated = dict(execution, classification=decision,
+                        classification_source_hash=evidence['intent_hash'])
+                    _cas(db,evidence,execution,updated)
+                    execution = updated
+                    scope['evidence']['owner_classification'] = decision
                 result = callback()
                 validate()
             except Exception:

@@ -28,7 +28,7 @@ from plugins.platforms.discord.adapter import DiscordAdapter
 from tools.approval_context import set_current_observability_context, reset_current_observability_context
 
 
-def rig(tmp_path, monkeypatch):
+def rig(tmp_path, monkeypatch, *, dm=False):
     monkeypatch.setenv('HERMES_HOME',str(tmp_path))
     monkeypatch.setenv('DISCORD_ALLOWED_USERS','123')
     monkeypatch.setattr(ledger,'_db_path',lambda:tmp_path/'state.db')
@@ -48,11 +48,17 @@ def rig(tmp_path, monkeypatch):
     channel = discord.Thread(state=state,guild=guild,data={'id':'222','name':'synthetic thread','type':11,
         'parent_id':'221','owner_id':'123','rate_limit_per_user':0,'message_count':1,'member_count':1,
         'thread_metadata':{'archived':False,'locked':False,'auto_archive_duration':60,'archive_timestamp':'2026-11-03T00:00:00+00:00'}})
+    if dm:
+        channel = discord.DMChannel(state=state, me=SimpleNamespace(id=999), data={
+            'id':'222','type':1,'recipients':[{'id':'123','username':'Synthetic','discriminator':'0','avatar':None}]})
     raw = discord.Message(state=state,channel=channel,data={'id':'444','content':'@mara ordinary report',
         'author':{'id':'123','username':'Synthetic','discriminator':'0','avatar':None},
         'timestamp':'2026-11-03T00:00:00+00:00','type':0,'attachments':[], 'embeds':[], 'mentions':[],
         'mention_roles':[], 'pinned':False,'mention_everyone':False,'tts':False})
     source = adapter.build_source(chat_id='222',thread_id='222',guild_id='333',user_id='123',chat_type='thread')
+    if dm:
+        raw.content = 'Explicit Ignis synthetic work request'
+        source = adapter.build_source(chat_id='222',user_id='123',chat_type='dm')
     event = MessageEvent(text=raw.content,source=source,message_id=str(raw.id),raw_message=raw)
     db = SessionDB(db_path=tmp_path/'state.db');db.create_session('source-session',source='discord')
     runner._session_db = db;runner._running = True
@@ -150,6 +156,8 @@ async def test_only_authorized_native_external_turn_can_bind_and_scope_revokes(t
         captured = []
         def inspect():
             source = current_gateway_source();assert source
+            from gateway.accepted_source import current_gateway_source_message
+            assert current_gateway_source_message() == r.event.text
             assert source['turn_id'] == r.turn and source['message_id'] == '444'
             captured.append(copy_context())
             # Exercise the actual bounded native hook worker, not a direct
@@ -175,6 +183,7 @@ async def test_only_authorized_native_external_turn_can_bind_and_scope_revokes(t
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 assert pool.submit(copy_context().run,current_gateway_source).result(timeout=5) is None
+                assert pool.submit(copy_context().run,current_gateway_source_message).result(timeout=5) is None
             from hermes_constants import set_hermes_home_override,reset_hermes_home_override
             token = set_hermes_home_override(tmp_path/'profile-b')
             try:assert current_gateway_source() is None

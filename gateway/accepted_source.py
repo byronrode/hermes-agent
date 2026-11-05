@@ -14,6 +14,7 @@ from pathlib import Path
 _current = ContextVar('authorized_gateway_source', default=None)
 _execution = ContextVar('authorized_gateway_execution', default=None)
 _inspection = ContextVar('authorized_gateway_inspection', default=None)
+_message = ContextVar('authorized_gateway_message', default=None)
 
 
 @contextmanager
@@ -167,11 +168,13 @@ def authorized_event_scope(runner, event, source, session_id, session_key, gener
             display_metadata['gateway_accepted_source'] = bound
         return bound
     token = _current.set(resolve)
+    message_token = _message.set(lambda: event.text)
     try:
         yield base
     finally:
         active = False
         _current.reset(token)
+        _message.reset(message_token)
 
 
 def current_gateway_source(*, session_id=None, admit=True):
@@ -181,3 +184,10 @@ def current_gateway_source(*, session_id=None, admit=True):
     except (sqlite3.Error,OSError,ValueError,KeyError,OverflowError):
         return None
     return source
+
+
+def current_gateway_source_message(*, session_id=None):
+    """Private original text under the same native admission capability."""
+    source = current_gateway_source(session_id=session_id)
+    reader = _message.get()
+    return reader() if source is not None and reader is not None else None

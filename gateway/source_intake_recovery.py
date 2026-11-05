@@ -15,7 +15,8 @@ _REASONS = frozenset({'qualified_source_required','source_custody_changed','unbo
     'intake_not_failed_before_capture','unique_failed_intake_required','recovery_custody_changed',
     'recovery_payload_changed','gateway_owner_unavailable','intake_recovery_unavailable','source_owner_live',
     'source_owner_or_policy_changed','recovery_evidence_changed','recovery_owner_live',
-    'recovery_attempts_exhausted','recovery_owner_unqualified','no_caller_payload_permitted'})
+    'recovery_attempts_exhausted','recovery_owner_unqualified','no_caller_payload_permitted',
+    'intake_reclassification_required','pre_capture_failure_unproven'})
 
 
 def current_intake_recovery():
@@ -73,6 +74,14 @@ def failed_intake(db, message_id, tool_name):
             if prior is None:
                 raise ValueError('unbound_intake_result')
             result = json.loads(message['content'])
+            # An accepted source proves custody, not which code failed. Legacy
+            # authority errors do not prove validation ran before any capture.
+            if result.get('blocked_phase') == 'source_authority':
+                raise ValueError('pre_capture_failure_unproven')
+            # Replaying unchanged invalid arguments cannot correct classification.
+            # Keep this source unconsumed until its native owner can reclassify.
+            if result.get('blocked_phase') == 'input_validation':
+                raise ValueError('intake_reclassification_required')
             # Context selection precedes capture. Retry it through the same
             # source/payload custody and current provider-policy checks below.
             if (result.get('blocked_phase') not in {'work_context', 'canonical_capture'}

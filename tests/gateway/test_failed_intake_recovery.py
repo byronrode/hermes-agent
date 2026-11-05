@@ -84,6 +84,27 @@ async def close(f):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('phase,reason', [
+    ('source_authority', 'pre_capture_failure_unproven'),
+    ('input_validation', 'intake_reclassification_required'),
+])
+async def test_reclassification_refusal_preserves_original_custody(tmp_path, monkeypatch, phase, reason):
+    f = await fixture(tmp_path, monkeypatch, blocked_phase=phase)
+    try:
+        before = [tuple(row) for row in f.r.db._read_all(
+            'SELECT id,content,tool_calls,display_metadata FROM messages ORDER BY id')]
+        response = await f.client.post('/v1/gateway-sources/444/retry-intake',
+            headers={'Authorization': 'Bearer synthetic-operator-key'}, json={})
+        assert response.status == 409
+        assert (await response.json())['reason'] == reason
+        assert not f.attempts
+        assert [tuple(row) for row in f.r.db._read_all(
+            'SELECT id,content,tool_calls,display_metadata FROM messages ORDER BY id')] == before
+    finally:
+        await close(f)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('encoded_arguments', [False, True])
 @pytest.mark.parametrize('blocked_phase', ['canonical_capture', 'work_context'])
 async def test_authenticated_failed_intake_exact_replay_restart_and_current_permission(tmp_path,monkeypatch,encoded_arguments,blocked_phase):

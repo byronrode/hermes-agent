@@ -8,10 +8,18 @@ declares `gateway_intake_tool`, `validate_gateway_intake_recovery()` and
 Only the gateway owner reconstructs authority: exactly one persisted Discord user
 row with its native candidate and accepted source, one matching stored tool call
 (direct or the native single-call `tool_call` envelope), and its bound tool result.
-The result must explicitly report `canonical_capture` failure, false execution
+The result must explicitly report `work_context` or `canonical_capture` failure, false execution
 and delivery verification, and no returned item receipt. No caller payload or
 source metadata is accepted as authority. Multiple/ambiguous/successful tool
 results and unauthenticated source failures are unavailable.
+
+`source_authority` failures return `pre_capture_failure_unproven`: an accepted
+source does not prove that the failed invocation reached input validation.
+`input_validation` failures return `intake_reclassification_required`: replaying
+the stored arguments cannot correct a classification. Neither refusal invokes
+the provider or changes source consumption, original tool rows or recovery
+metadata. These reasons diagnose a blocked recovery; they do not implement
+native reclassification or authorize operator-supplied corrections.
 
 Current source authorization, profile/home, transport owner, provider and source
 policy are rechecked. A native cross-process conversation lease excludes live

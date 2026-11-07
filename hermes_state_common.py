@@ -595,6 +595,9 @@ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
 DEFERRED_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_messages_source_generations
+    ON messages(platform_message_id, display_identity)
+    WHERE platform_message_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_display_page

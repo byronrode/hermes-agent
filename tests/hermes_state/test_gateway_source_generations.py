@@ -21,7 +21,7 @@ def source_copies(db):
 
 
 @pytest.mark.parametrize("all_archived", [False, True])
-def test_compaction_copies_share_poll_and_consumption_across_restart(tmp_path, all_archived):
+def test_compaction_copies_share_poll_and_consumption_across_restart(tmp_path, monkeypatch, all_archived):
     path = tmp_path / "state.db"
     db = SessionDB(path)
     source, candidate, carried = source_copies(db)
@@ -38,7 +38,16 @@ def test_compaction_copies_share_poll_and_consumption_across_restart(tmp_path, a
     assert db.bind_gateway_source_turn("source", candidate, "turn",
                                      {"session_id": "source", "platform": "discord",
                                       "provider": "existing-owner", "profile": "default"}) == source
+    plans = []
+    read_all = db._read_all
+    def inspect_poll(sql, params=()):
+        if "NOT EXISTS" in sql:
+            plans.extend(read_all("EXPLAIN QUERY PLAN " + sql, params))
+        return read_all(sql, params)
+    monkeypatch.setattr(db, "_read_all", inspect_poll)
     assert db.pending_gateway_sources() == [source]
+    assert any("SEARCH p USING INDEX" in row["detail"] for row in plans)
+    assert not any(row["detail"] == "SCAN p" for row in plans)
     assert db.gateway_source_row(source) == rows[1]["id"]
     db.mark_gateway_source_polled(source)
     sequences = [json.loads(r[0])["gateway_source_poll_sequence"] for r in

@@ -197,7 +197,7 @@ class TurnRunner:
             logger.debug("subagent failure notice failed", exc_info=True)
 
     async def _deliver_notice_if_allowed(self, line):
-        if self._ctx.publication_allowed():
+        if self._ctx.publication_allowed(probe=True):
             await self._runner._deliver_platform_notice(self._ctx.source, line)
 
     def _progress_live_status(self, event_type: str, tool_name, args) -> None:
@@ -412,7 +412,7 @@ class TurnRunner:
 
     async def _task_card_publish(self, st) -> None:
         ctx = self._ctx
-        if not ctx.publication_allowed():
+        if not ctx.publication_allowed(probe=True):
             return
         if not st.tasks:
             return
@@ -573,7 +573,7 @@ class TurnRunner:
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
-        if not ctx.publication_allowed():
+        if not ctx.publication_allowed(probe=True):
             return SendResult(success=False, error="Response belongs to the observed native owner")
         kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
         if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
@@ -600,7 +600,7 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
-        if not ctx.publication_allowed():
+        if not ctx.publication_allowed(probe=True):
             return SendResult(success=False, error="Response belongs to the observed native owner")
         result = await st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
@@ -861,7 +861,7 @@ class TurnRunner:
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx
         async def send_if_allowed():
-            if ctx.publication_allowed():
+            if ctx.publication_allowed(probe=True):
                 await ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata)
         self._schedule(send_if_allowed(), log_message)
 
@@ -912,7 +912,7 @@ class TurnRunner:
             return
         def present():
             async def send_if_allowed():
-                if ctx.publication_allowed():
+                if ctx.publication_allowed(probe=True):
                     await _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata)
             fut = self._schedule(
                 send_if_allowed(),
@@ -966,7 +966,7 @@ class TurnRunner:
                         ),
                         on_before_finalize=pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
-                        run_still_current=lambda: ctx._run_still_current() and ctx.publication_allowed(),
+                        run_still_current=lambda: ctx._run_still_current() and ctx.publication_allowed(probe=True),
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
                     # #105341: a consumer created only for interim commentary (text streaming off)

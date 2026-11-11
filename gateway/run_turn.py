@@ -1934,7 +1934,7 @@ class GatewayTurnMixin:
         if diagnostic_wake_muted(event):
             return None
         from gateway.accepted_source import gateway_observation_muted
-        if gateway_observation_muted(event, inbound_message_id=agent_result.get('queued_terminal_inbound_id')):
+        if gateway_observation_muted(event, inbound_message_id=agent_result.get('queued_terminal_inbound_id'), probe=True):
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
@@ -2949,7 +2949,7 @@ class GatewayTurnMixin:
                     metadata.pop('gateway_source_consumed',None)
                     metadata['gateway_source_candidate'] = candidate
                     turn_kwargs['persist_user_display_metadata'] = metadata
-                    turn_kwargs['publication_allowed'] = lambda: not gateway_observation_muted(event)
+                    turn_kwargs['publication_allowed'] = lambda **options: not gateway_observation_muted(event, **options)
                 return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
@@ -4185,7 +4185,7 @@ class GatewayTurnMixin:
         _heartbeat_msg_id: Optional[str] = None
         while True:
             await asyncio.sleep(_NOTIFY_INTERVAL)
-            if not turn_ctx.publication_allowed():
+            if not turn_ctx.publication_allowed(probe=True):
                 break
             if not self._should_emit_long_running_notification(
                 session_key, agent_holder[0], _executor_task_holder[0]
@@ -4228,7 +4228,7 @@ class GatewayTurnMixin:
                     # a fresh "Working" bubble after it reads as a contradiction (#10990).
                     if not self._should_emit_long_running_notification(
                         session_key, agent_holder[0], _executor_task_holder[0]
-                    ) or not turn_ctx.publication_allowed():
+                    ) or not turn_ctx.publication_allowed(probe=True):
                         break
                     _notify_res = await _notify_adapter.send(
                         source.chat_id, _heartbeat_text,

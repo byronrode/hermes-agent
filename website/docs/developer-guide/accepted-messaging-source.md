@@ -4,10 +4,14 @@
 
 The selected source provider may call
 `gateway.accepted_source.record_gateway_observation(source=source, observation=proof)`
-from the admitted native tool execution. Its optional
+from trusted native pre-LLM inspection or admitted native tool execution. Its optional
 `validate_gateway_observation(source, observation)` method must freshly verify
 the same source's existing native response owner and return exactly `True`.
 Absent, failed or mismatched proof leaves normal publication available.
+An optional `gateway_observation(source)` callback supplies the same proof at
+the first presentation sink if concurrent native acceptance was not yet visible
+during inspection. This is attempted once, only after a real native inspection
+selected the provider; source and provider fences surround both provider reads.
 
 Successful observation creates only an in-process event receipt. Progress,
 queued edits, status, streamed commentary and the final secondary response are

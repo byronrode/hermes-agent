@@ -145,7 +145,8 @@ async def execute(r, monkeypatch, inside):
 
 
 @pytest.mark.asyncio
-async def test_native_owner_observation_mutes_only_same_accepted_response(tmp_path, monkeypatch):
+@pytest.mark.parametrize('observation_route', ['tool', 'inspection', 'egress', 'unproved_egress'])
+async def test_native_owner_observation_mutes_only_same_accepted_response(tmp_path, monkeypatch, observation_route):
     from gateway.accepted_source import record_gateway_observation, gateway_observation_muted
     from gateway.run_turn_runner import TurnRunner
     r=rig(tmp_path,monkeypatch)
@@ -153,7 +154,18 @@ async def test_native_owner_observation_mutes_only_same_accepted_response(tmp_pa
     r.provider.validate_gateway_observation=lambda source,observation: observation==proof
     queued=[]
     status_send=AsyncMock()
+    probes=[]
     try:
+        if observation_route == 'inspection':
+            def inspect_before_flush():
+                assert current_gateway_source() is None
+                assert record_gateway_observation(source=current_gateway_source(admit=False),observation=proof)
+            r.before_tool=inspect_before_flush
+        if observation_route in {'egress','unproved_egress'}:
+            def find_native_owner(source):
+                probes.append(source)
+                return proof if observation_route == 'egress' else None
+            r.provider.gateway_observation=find_native_owner
         def observe():
             source=current_gateway_source()
             r.turn_ctx._status_adapter=SimpleNamespace(send=status_send)
@@ -163,11 +175,20 @@ async def test_native_owner_observation_mutes_only_same_accepted_response(tmp_pa
             progress._send_status_text('queued before observation',{},'test')
             assert record_gateway_observation(source={**source,'message_id':'other'},observation=proof) is False
             assert record_gateway_observation(source=source,observation={'owner_id':'unproved'}) is False
-            assert record_gateway_observation(source=source,observation=proof) is True
+            if observation_route == 'tool':
+                assert record_gateway_observation(source=source,observation=proof) is True
             return {'final_response':'duplicate clarification','completed':True}
         await execute(r,monkeypatch,observe)
         assert current_gateway_source() is None
-        assert gateway_observation_muted(r.event) is True
+        if observation_route == 'unproved_egress':
+            assert not gateway_observation_muted(r.event,probe=True)
+            assert not gateway_observation_muted(r.event,probe=True)
+            assert len(probes)==1
+            for pending in queued:await pending
+            status_send.assert_awaited_once()
+            return
+        assert gateway_observation_muted(r.event,probe=True) is True
+        if observation_route == 'egress':assert len(probes)==1
         assert gateway_observation_muted(r.event,inbound_message_id='different-user-turn') is False
         assert r.turn_ctx.publication_allowed() is False
         for pending in queued:await pending

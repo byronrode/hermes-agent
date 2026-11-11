@@ -23,7 +23,7 @@ from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import canonicalize_replay_history
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -124,6 +124,8 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        if not ctx.publication_allowed():
+            return
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
         if event_type == "subagent.complete":
@@ -189,17 +191,21 @@ class TurnRunner:
                     duration_seconds=kwargs.get("duration_seconds"), failure_reason=kwargs.get("failure_reason"),
                 )
                 render_notification(
-                    lambda: self._schedule(self._runner._deliver_platform_notice(ctx.source, line), "subagent failure notice scheduling error"),
+                    lambda: self._schedule(self._deliver_notice_if_allowed(line), "subagent failure notice scheduling error"),
                     platform=ctx.source.platform, user_config=ctx.user_config)
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
+
+    async def _deliver_notice_if_allowed(self, line):
+        if self._ctx.publication_allowed():
+            await self._runner._deliver_platform_notice(self._ctx.source, line)
 
     def _progress_live_status(self, event_type: str, tool_name, args) -> None:
         """Live status line (Slack assistant status): stash the tool phrase on the adapter; the
         _keep_typing refresh renders it. Plain dict write, safe from the sync worker thread."""
         ctx = self._ctx
         adapter = ctx._live_status_adapter
-        if adapter is None or ctx._live_status_mode == "off" or tool_name == "_thinking":
+        if adapter is None or ctx._live_status_mode == "off" or tool_name == "_thinking" or not ctx.publication_allowed():
             return
         try:
             if event_type == "tool.started" and tool_name and ctx._run_still_current():
@@ -406,6 +412,8 @@ class TurnRunner:
 
     async def _task_card_publish(self, st) -> None:
         ctx = self._ctx
+        if not ctx.publication_allowed():
+            return
         if not st.tasks:
             return
         if st.publication_suppressed:
@@ -565,6 +573,8 @@ class TurnRunner:
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
+        if not ctx.publication_allowed():
+            return SendResult(success=False, error="Response belongs to the observed native owner")
         kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
         if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
             kwargs["finalize"] = True
@@ -590,6 +600,8 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
+        if not ctx.publication_allowed():
+            return SendResult(success=False, error="Response belongs to the observed native owner")
         result = await st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
         )
@@ -722,7 +734,7 @@ class TurnRunner:
         EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
         while True:
             try:
-                if not ctx._run_still_current():
+                if not ctx._run_still_current() or not ctx.publication_allowed():
                     self._drain_progress_queue()
                     return
                 raw = ctx.progress_queue.get_nowait()
@@ -844,11 +856,14 @@ class TurnRunner:
 
     def _status_live(self) -> bool:
         """Status adapter present and this run is still the current generation."""
-        return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
+        return bool(self._ctx._status_adapter) and self._ctx._run_still_current() and self._ctx.publication_allowed()
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx
-        self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+        async def send_if_allowed():
+            if ctx.publication_allowed():
+                await ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata)
+        self._schedule(send_if_allowed(), log_message)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
         """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
@@ -896,8 +911,11 @@ class TurnRunner:
             )
             return
         def present():
+            async def send_if_allowed():
+                if ctx.publication_allowed():
+                    await _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata)
             fut = self._schedule(
-                _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
+                send_if_allowed(),
                 f"status_callback ({event_type}) scheduling error",
             )
             if fut is not None and ctx._cleanup_progress:
@@ -947,7 +965,8 @@ class TurnRunner:
                             (lambda: ctx.progress_queue.put(("__reset__",))) if ctx.progress_queue is not None else None
                         ),
                         on_before_finalize=pause_typing_before_finalize,
-                        initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
+                        initial_reply_to_id=ctx.event_message_id,
+                        run_still_current=lambda: ctx._run_still_current() and ctx.publication_allowed(),
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
                     # #105341: a consumer created only for interim commentary (text streaming off)
@@ -966,12 +985,12 @@ class TurnRunner:
         stream_delta_cb = None
         if delta_sinks:
             def stream_delta_cb(text: Optional[str]) -> None:
-                if ctx._run_still_current():
+                if ctx._run_still_current() and ctx.publication_allowed():
                     for sink in delta_sinks:
                         sink.on_delta(text)
 
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-            if not ctx._run_still_current():
+            if not ctx._run_still_current() or not ctx.publication_allowed():
                 return
             if stts is not None:
                 # Flush accepted deltas; completed commentary is a separate speech segment.

@@ -135,11 +135,83 @@ async def execute(r, monkeypatch, inside):
                 effective_task_id=session_id,tool_call_id='synthetic-native-tool',execute=call).result
         r.run_tool=run_tool
         ctx=TurnContext(source=source,session_id=session_id,session_key=r.key,message=message,
-            inbound_message_id=r.event.message_id,persist_user_display_metadata=metadata)
+            inbound_message_id=r.event.message_id,persist_user_display_metadata=metadata,
+            publication_allowed=kwargs.get('publication_allowed', lambda: True))
+        r.turn_ctx=ctx
         return TurnRunner(r.runner,ctx)._run_conversation_with_approval(agent,[],None,None,None)
     monkeypatch.setattr(r.runner,'_run_agent_inner',synthetic_model)
     return await r.runner._run_agent(r.event.text,'',[],r.source,getattr(r,'session_id','source-session'),
         session_key=r.key,run_generation=r.generation,authorized_event=r.event)
+
+
+@pytest.mark.asyncio
+async def test_native_owner_observation_mutes_only_same_accepted_response(tmp_path, monkeypatch):
+    from gateway.accepted_source import record_gateway_observation, gateway_observation_muted
+    from gateway.run_turn_runner import TurnRunner
+    r=rig(tmp_path,monkeypatch)
+    proof={'issue_id':'existing-native-task','owner_id':'department'}
+    r.provider.validate_gateway_observation=lambda source,observation: observation==proof
+    queued=[]
+    status_send=AsyncMock()
+    try:
+        def observe():
+            source=current_gateway_source()
+            r.turn_ctx._status_adapter=SimpleNamespace(send=status_send)
+            r.turn_ctx._status_chat_id='222'
+            progress=TurnRunner(r.runner,r.turn_ctx)
+            progress._schedule=lambda coro,*_args: queued.append(coro)
+            progress._send_status_text('queued before observation',{},'test')
+            assert record_gateway_observation(source={**source,'message_id':'other'},observation=proof) is False
+            assert record_gateway_observation(source=source,observation={'owner_id':'unproved'}) is False
+            assert record_gateway_observation(source=source,observation=proof) is True
+            return {'final_response':'duplicate clarification','completed':True}
+        await execute(r,monkeypatch,observe)
+        assert current_gateway_source() is None
+        assert gateway_observation_muted(r.event) is True
+        assert gateway_observation_muted(r.event,inbound_message_id='different-user-turn') is False
+        assert r.turn_ctx.publication_allowed() is False
+        for pending in queued:await pending
+        status_send.assert_not_awaited()
+        sent=AsyncMock()
+        transport=SimpleNamespace(send=sent,edit_message=AsyncMock())
+        progress=TurnRunner(r.runner,r.turn_ctx)
+        assert not (await progress._send_progress_text(SimpleNamespace(adapter=transport),'queued progress')).success
+        assert not (await progress._edit_progress_message(SimpleNamespace(adapter=transport),'old-progress','queued edit')).success
+        sent.assert_not_awaited()
+        transport.edit_message.assert_not_awaited()
+        result=await r.runner._hmwa_deliver_turn_response(
+            r.event,r.source,None,r.key,r.generation,{},[],'duplicate final','',False)
+        assert result is None
+        r.runner._begin_session_run_generation(r.key)
+        assert gateway_observation_muted(r.event) is False
+    finally:r.db.close()
+
+
+@pytest.mark.asyncio
+async def test_observer_proof_cannot_be_forged_or_replayed(tmp_path, monkeypatch):
+    from gateway.accepted_source import record_gateway_observation, gateway_observation_muted
+    r=rig(tmp_path,monkeypatch)
+    r.event.metadata['gateway_observation']={'owner_id':'claimed'}
+    assert not gateway_observation_muted(r.event)
+    assert not record_gateway_observation(source={},observation={})
+    try:
+        def observe():
+            source=current_gateway_source()
+            assert not record_gateway_observation(source=source,observation={})
+            def unavailable(*_args):raise OSError('native owner unavailable')
+            r.provider.validate_gateway_observation=unavailable
+            assert not record_gateway_observation(source=source,observation={})
+            r.provider.validate_gateway_observation=lambda *_args: True
+            assert record_gateway_observation(source=source,observation={})
+            return source
+        source=await execute(r,monkeypatch,observe)
+        assert not record_gateway_observation(source=source,observation={})
+        assert gateway_observation_muted(r.event)
+        r.manager._api_source_providers={}
+        assert not gateway_observation_muted(r.event)
+        r.manager._api_source_providers={'synthetic':r.provider}
+        assert not gateway_observation_muted(r.event)
+    finally:r.db.close()
 
 
 @pytest.mark.asyncio

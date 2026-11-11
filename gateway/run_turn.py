@@ -1933,6 +1933,9 @@ class GatewayTurnMixin:
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         if diagnostic_wake_muted(event):
             return None
+        from gateway.accepted_source import gateway_observation_muted
+        if gateway_observation_muted(event, inbound_message_id=agent_result.get('queued_terminal_inbound_id')):
+            return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
@@ -2937,7 +2940,7 @@ class GatewayTurnMixin:
         when multiplexing is off)."""
         with self._profile_scope_for_source(source):
             event = turn_kwargs.pop('authorized_event', None)
-            from gateway.accepted_source import authorized_event_scope
+            from gateway.accepted_source import authorized_event_scope, gateway_observation_muted
             metadata = dict(turn_kwargs.get('persist_user_display_metadata') or {})
             with authorized_event_scope(self,event,source,session_id,turn_kwargs.get('session_key'),
                                         turn_kwargs.get('run_generation'),metadata) as candidate:
@@ -2946,6 +2949,7 @@ class GatewayTurnMixin:
                     metadata.pop('gateway_source_consumed',None)
                     metadata['gateway_source_candidate'] = candidate
                     turn_kwargs['persist_user_display_metadata'] = metadata
+                    turn_kwargs['publication_allowed'] = lambda: not gateway_observation_muted(event)
                 return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
@@ -4181,6 +4185,8 @@ class GatewayTurnMixin:
         _heartbeat_msg_id: Optional[str] = None
         while True:
             await asyncio.sleep(_NOTIFY_INTERVAL)
+            if not turn_ctx.publication_allowed():
+                break
             if not self._should_emit_long_running_notification(
                 session_key, agent_holder[0], _executor_task_holder[0]
             ):
@@ -4222,7 +4228,7 @@ class GatewayTurnMixin:
                     # a fresh "Working" bubble after it reads as a contradiction (#10990).
                     if not self._should_emit_long_running_notification(
                         session_key, agent_holder[0], _executor_task_holder[0]
-                    ):
+                    ) or not turn_ctx.publication_allowed():
                         break
                     _notify_res = await _notify_adapter.send(
                         source.chat_id, _heartbeat_text,
@@ -4245,6 +4251,7 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
         scheduled_heartbeat: bool = False,
+        publication_allowed=None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4283,6 +4290,8 @@ class GatewayTurnMixin:
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
         )
+        if publication_allowed is not None:
+            turn_ctx.publication_allowed = publication_allowed
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )

@@ -1,5 +1,24 @@
 # Post-authorization messaging source and return
 
+## Observing an existing native response owner
+
+The selected source provider may call
+`gateway.accepted_source.record_gateway_observation(source=source, observation=proof)`
+from the admitted native tool execution. Its optional
+`validate_gateway_observation(source, observation)` method must freshly verify
+the same source's existing native response owner and return exactly `True`.
+Absent, failed or mismatched proof leaves normal publication available.
+
+Successful observation creates only an in-process event receipt. Progress,
+queued edits, status, streamed commentary and the final secondary response are
+muted while that exact source, profile, run generation and provider registration
+remain valid. A distinct queued user message keeps its response. Revocation does
+not revive when a provider is re-added. Model silence markers, ingress metadata
+and copied receipts cannot select this policy. Native task ownership, authorization,
+durable source records and the original owner's reply route remain unchanged.
+
+## Current source custody
+
 `gateway.accepted_source.current_gateway_source(session_id=...)` is a trusted
 in-process consumer API. Public IDs, hook metadata and copied dictionaries are
 not credentials. The initial supported transport is native Discord, default

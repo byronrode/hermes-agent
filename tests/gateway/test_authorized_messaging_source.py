@@ -191,6 +191,16 @@ async def test_native_owner_observation_mutes_only_same_accepted_response(tmp_pa
         if observation_route == 'egress':assert len(probes)==1
         assert gateway_observation_muted(r.event,inbound_message_id='different-user-turn') is False
         assert r.turn_ctx.publication_allowed() is False
+        r.runner._deliver_queued_first_response=AsyncMock(return_value=True)
+        first={'final_response':'duplicate clarification before queued follow-up'}
+        await r.runner._run_agent_deliver_first_response(r.turn_ctx,None,first,first,None)
+        r.runner._deliver_queued_first_response.assert_not_awaited()
+        original_inbound=r.turn_ctx.inbound_message_id
+        r.turn_ctx.inbound_message_id='different-user-turn'
+        followup={'final_response':'answer to distinct queued follow-up'}
+        await r.runner._run_agent_deliver_first_response(r.turn_ctx,None,followup,followup,None)
+        r.runner._deliver_queued_first_response.assert_awaited_once()
+        r.turn_ctx.inbound_message_id=original_inbound
         for pending in queued:await pending
         status_send.assert_not_awaited()
         sent=AsyncMock()

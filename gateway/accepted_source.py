@@ -15,6 +15,7 @@ _current = ContextVar('authorized_gateway_source', default=None)
 _execution = ContextVar('authorized_gateway_execution', default=None)
 _inspection = ContextVar('authorized_gateway_inspection', default=None)
 _message = ContextVar('authorized_gateway_message', default=None)
+_observation = ContextVar('authorized_gateway_observation', default=None)
 
 
 @contextmanager
@@ -110,8 +111,10 @@ def authorized_event_scope(runner, event, source, session_id, session_key, gener
         base = dict(route, run_id='run_' + _digest(event_key)[:32], auth_scope=_digest(route))
     active = True
     selected_owner = None
+    latest_inspection = None
+    probe_attempted = False
     def resolve(admit, requested_session):
-        nonlocal active, selected_owner
+        nonlocal active, selected_owner, latest_inspection
         from agent.delegation_context import is_delegated_child_process_context
         from tools.approval_context import _approval_turn_id, _approval_session_id
         execution = _execution.get()
@@ -156,10 +159,11 @@ def authorized_event_scope(runner, event, source, session_id, session_key, gener
         selected_owner = (manager,provider)
         if not isinstance(choice,dict) or set(choice) != {'intent'}:
             return None
+        latest_inspection = dict(base,turn_id=execution[2]._current_turn_id,provider=name,intent=choice['intent'])
         if not admit:
             # Hooks precede the inbound-row flush. This revocable inspection is
             # guidance only: admitting tools must still bind the durable row.
-            return dict(base,turn_id=execution[2]._current_turn_id,provider=name,intent=choice['intent'])
+            return dict(latest_inspection)
         bound = db.bind_gateway_source_turn(session_id,base,execution[2]._current_turn_id,
             {'provider':name,'intent':choice['intent']},admit=admit)
         if admit and bound and display_metadata is not None:
@@ -167,13 +171,83 @@ def authorized_event_scope(runner, event, source, session_id, session_key, gener
             # flush, so persistence cannot erase the DB-owned turn binding.
             display_metadata['gateway_accepted_source'] = bound
         return bound
+    def presentation_scope_current(expected_source, manager, provider):
+        from hermes_cli.plugins import get_plugin_manager
+        return bool(base and selected_owner and selected_owner[0] is manager and selected_owner[1] is provider
+            and get_plugin_manager() is manager
+            and manager._api_source_providers.get(expected_source['provider']) is provider
+            and Path(get_hermes_home()).resolve() == home
+            and runner._is_session_run_current(session_key, generation)
+            and runner._intake_adapter_for(source) is intake and intake.is_connected is True
+            and facts_reader(event) == facts and str(event.message_id) == base['message_id']
+            and hashlib.sha256(event.text.encode()).hexdigest() == base['message_sha256']
+            and (source.profile or 'default') == profile and source.chat_type == base['chat_type']
+            and (str(source.chat_id), str(source.thread_id or ''), str(source.user_id),
+                 str(source.scope_id or ''), str(source.parent_chat_id or ''))
+            == (base['channel_id'], base['thread_id'], base['user_id'], base['guild_id'], base['parent_channel_id'])
+            and runner._is_user_authorized_for_source(source, allow_adapter_delegation=False))
+
+    def install_observation(expected_source, observation, *, inspection=False):
+        if selected_owner is None:
+            return False
+        manager, provider = selected_owner
+        expected_source = dict(expected_source)
+        validator = getattr(provider, 'validate_gateway_observation', None)
+        if not callable(validator) or not presentation_scope_current(expected_source,manager,provider):
+            return False
+        try:
+            verified = validator(dict(expected_source), dict(observation)) is True
+        except Exception:
+            # Unavailable native proof leaves normal publication available.
+            return False
+        if not verified or not presentation_scope_current(expected_source,manager,provider):
+            return False
+        if inspection and resolve(False, expected_source.get('session_id')) != expected_source:
+            return False
+        observed = True
+
+        def still_observed():
+            nonlocal observed
+            observed = bool(
+                observed and presentation_scope_current(expected_source,manager,provider)
+            )
+            return observed
+
+        event._gateway_observation_guard = still_observed
+        return True
+
+    def observe(expected_source, observation):
+        if resolve(False, expected_source.get('session_id')) != expected_source:
+            return False
+        return install_observation(expected_source,observation,inspection=True)
+
+    def probe_observation():
+        nonlocal probe_attempted
+        if probe_attempted or latest_inspection is None or selected_owner is None:
+            return
+        manager, provider = selected_owner
+        reader = getattr(provider,'gateway_observation',None)
+        if not callable(reader) or not presentation_scope_current(latest_inspection,manager,provider):
+            return
+        probe_attempted = True
+        try:
+            proof = reader(dict(latest_inspection))
+        except Exception:
+            return
+        if isinstance(proof,dict):
+            install_observation(latest_inspection,proof)
+
+    if eligible:
+        event._gateway_observation_probe = probe_observation
     token = _current.set(resolve)
+    observation_token = _observation.set(observe)
     message_token = _message.set(lambda: event.text)
     try:
         yield base
     finally:
         active = False
         _current.reset(token)
+        _observation.reset(observation_token)
         _message.reset(message_token)
 
 
@@ -191,3 +265,28 @@ def current_gateway_source_message(*, session_id=None):
     source = current_gateway_source(session_id=session_id)
     reader = _message.get()
     return reader() if source is not None and reader is not None else None
+
+
+def record_gateway_observation(*, source, observation):
+    """Let the selected source provider attest an existing response owner for this event.
+
+    Trusted pre-LLM inspection may observe before inbound-row admission. The
+    provider revalidates its native owner proof. User metadata and model output
+    cannot create this process-local receipt, and it never changes task authority.
+    """
+    recorder = _observation.get()
+    if not callable(recorder) or not isinstance(source, dict) or not isinstance(observation, dict):
+        return False
+    return recorder(source, observation)
+
+
+def gateway_observation_muted(event, *, inbound_message_id=None, probe=False):
+    """Presentation-only decision; a queued distinct user turn retains its own reply."""
+    if event is None or (inbound_message_id and str(inbound_message_id) != str(event.message_id)):
+        return False
+    guard = getattr(event, '_gateway_observation_guard', None)
+    if guard is None and probe:
+        reader = getattr(event,'_gateway_observation_probe',None)
+        if callable(reader):reader()
+        guard = getattr(event, '_gateway_observation_guard', None)
+    return callable(guard) and guard() is True

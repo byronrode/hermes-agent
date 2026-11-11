@@ -547,8 +547,9 @@ Behavior by surface:
 
 - **Server channels** (with `require_mention: true`): backfill scans the channel since the bot's last response. Useful when other participants posted while the bot wasn't addressed.
 - **Threads**: backfill scans the thread only — Discord's `channel.history()` on a thread returns only that thread's messages, not the parent channel. This is the right scope because threads are usually self-contained conversations.
+- **New auto-created threads**: the opening request includes bounded recent context from its original parent channel. Channel and message IDs identify that background material; it is not a new request or permission to act. Replies still go to the new thread, and later thread turns scan that thread only.
 - **DMs**: skipped. Every DM message triggers the bot, so the session transcript is already complete — there's no mention gap to fill.
-- **Free-response channels** and **bot's own auto-created threads**: skipped for the same reason — no mention gating means no gap.
+- **Free-response channels**: skipped unless the message is a reply or creates a new thread.
 
 Per-user sessions (`group_sessions_per_user: true`, the default) also benefit: a user's session is missing the context posted by other channel participants and the user's own messages from before they tagged the bot. Backfill fills both gaps.
 

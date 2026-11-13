@@ -49,7 +49,11 @@ def evaluate(platform: str, recipient: str, content: str, *, controls=None,
             'profile_home': str(home), 'provenance': provenance}, settings=policy.get('settings') or {})
         if isinstance(receipt, dict) and receipt.get('allow') is True:
             if operation == 'emit':
-                reply_handoff(platform, recipient, content, consume=True, profile_home=home)
+                if provenance and provenance.get('_handoff_key'):
+                    with _reply_grants_lock:
+                        _reply_grants.pop(provenance['_handoff_key'], None)
+                else:
+                    reply_handoff(platform, recipient, content, consume=True, profile_home=home)
             return receipt
         return {**(receipt if isinstance(receipt, dict) else {}),
                 **held(receipt.get('reason', 'outbound policy held the message') if isinstance(receipt, dict) else 'outbound policy held the message')}
@@ -189,25 +193,29 @@ def authorized_reply_scope(runner, event, source, session_key, generation):
     home = None
     from hermes_constants import get_hermes_home
     home = str(get_hermes_home())
+    native_valid = False
+    intake = None
+    if platform == 'whatsapp_cloud':
+        native_valid = (isinstance(raw, dict) and str(raw.get('id', '')) == message_id
+                        and str(raw.get('from', '')) == actor)
+    elif platform == 'discord':
+        intake = runner._intake_adapter_for(source)
+        reader = getattr(intake, 'source_event_identity', None)
+        native_valid = bool(callable(reader) and reader(event))
     def resolve():
-        if (not active or event is None or getattr(event, 'internal', False)
+        # Native identity is captured before trusted skill/context rendering rewrites
+        # event.text. Presentation text is not the authenticated envelope identity.
+        if (not active or not native_valid or event is None or getattr(event, 'internal', False)
                 or getattr(source, 'is_bot', False) or not message_id
                 or str(get_hermes_home()) != home
                 or not runner._is_session_run_current(session_key, generation)
                 or not runner._is_user_authorized_for_source(source, allow_adapter_delegation=False)
                 or str(source.user_id or '') != actor or str(source.chat_id or '') != recipient
-                or str(getattr(event, 'message_id', '') or '') != message_id
-                or str(getattr(event, 'text', '') or '') != original):
+                or str(getattr(event, 'message_id', '') or '') != message_id):
             return None
-        if platform == 'whatsapp_cloud':
-            if not isinstance(raw, dict) or str(raw.get('id', '')) != message_id or str(raw.get('from', '')) != actor:
-                return None
-        elif platform == 'discord':
-            adapter = runner._intake_adapter_for(source)
-            reader = getattr(adapter, 'source_event_identity', None)
-            if not callable(reader) or not reader(event):
-                return None
-        else:
+        if platform == 'whatsapp_cloud' and (str(raw.get('id', '')) != message_id or str(raw.get('from', '')) != actor):
+            return None
+        if platform == 'discord' and runner._intake_adapter_for(source) is not intake:
             return None
         return {'kind': 'authenticated_reply', 'home_scope': home, 'platform': platform, 'user_id': actor,
                 'recipient': recipient, 'message_id': message_id, 'source_text': original}
@@ -222,6 +230,8 @@ def authorized_reply_scope(runner, event, source, session_key, generation):
 def current_provenance(content):
     reader = _provenance.get()
     proof = reader() if callable(reader) else None
+    if proof and proof.get('_formatted_output_sha256s'):
+        return proof if _text_digest(content) in proof['_formatted_output_sha256s'] else None
     if proof and proof.get('kind') == 'personal_reminder' and proof.get('output_sha256') != _text_digest(content):
         return None
     return proof
@@ -258,4 +268,19 @@ def reply_handoff(platform, recipient, content, *, consume=False, profile_home=N
             return None
         if consume:
             _reply_grants.pop(key, None)
-        return dict(value[0])
+        return dict(value[0], _handoff_key=key)
+
+
+@contextmanager
+def formatted_output_scope(platform, recipient, original, formatted, *, profile_home):
+    """Carry custody only across this provider's exact native formatting result."""
+    proof = current_provenance(original) or reply_handoff(platform, recipient, original, profile_home=profile_home)
+    active = True
+    outputs = formatted if isinstance(formatted, (list, tuple)) else [formatted]
+    mapped = dict(proof, _formatted_output_sha256s=tuple(_text_digest(text) for text in outputs)) if proof else None
+    token = _provenance.set(lambda: mapped if active else None)
+    try:
+        yield
+    finally:
+        active = False
+        _provenance.reset(token)

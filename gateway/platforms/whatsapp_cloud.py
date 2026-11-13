@@ -405,31 +405,35 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 and await asyncio.to_thread(whatsapp_chat_window.is_open, self._window_home, self._phone_number_id, chat_id) is False):
             return await self.send_template(chat_id, content, scheduled_template, metadata=metadata)
         formatted = self.format_message(content)
-        last_message_id: Optional[str] = None
-        for idx, chunk in enumerate(self.truncate_message(formatted, self._outgoing_chunk_limit())):
-            # Quote the user's message on the first chunk only.
-            payload = self._outbound_payload(
-                chat_id, "text", {"body": chunk, "preview_url": True}, reply_to if idx == 0 else None
-            )
-            ids, err = await self._post_messages(
-                payload,
-                fail_log="[whatsapp_cloud] send failed",
-                reject_log="[whatsapp_cloud] send rejected (status=%d): %s",
-            )
-            if err is not None:
-                # Meta can close the window between our check and the first POST.
-                # 131047 is an explicit rejection; transport failures are uncertain and must not retry.
-                if (idx == 0 and (metadata or {}).get("job_id") and scheduled_template
-                        and err.startswith("graph error 131047 ")):
-                    return await self.send_template(chat_id, content, scheduled_template, metadata=metadata)
-                return SendResult(success=False, error=err)
-            last_message_id = ids[0].get("id") if ids else last_message_id
-            if (idx == 0 and last_message_id and (metadata or {}).get("job_id") and scheduled_template
-                    and len(" ".join(content.split())) <= 1024 and len(formatted) <= self._outgoing_chunk_limit()):
-                await asyncio.to_thread(whatsapp_chat_window.remember_send, self._window_home,
-                                        self._phone_number_id, chat_id, last_message_id, content,
-                                        scheduled_template, (metadata or {}).get("job_name"))
-                await self._retry_window_rejection(chat_id, last_message_id)
+        from gateway.outbound_policy import formatted_output_scope
+        chunks = self.truncate_message(formatted, self._outgoing_chunk_limit())
+        with formatted_output_scope('whatsapp_cloud', chat_id, content, chunks,
+                                    profile_home=self._outbound_policy_home):
+            last_message_id: Optional[str] = None
+            for idx, chunk in enumerate(chunks):
+                # Quote the user's message on the first chunk only.
+                payload = self._outbound_payload(
+                    chat_id, "text", {"body": chunk, "preview_url": True}, reply_to if idx == 0 else None
+                )
+                ids, err = await self._post_messages(
+                    payload,
+                    fail_log="[whatsapp_cloud] send failed",
+                    reject_log="[whatsapp_cloud] send rejected (status=%d): %s",
+                )
+                if err is not None:
+                    # Meta can close the window between our check and the first POST.
+                    # 131047 is an explicit rejection; transport failures are uncertain and must not retry.
+                    if (idx == 0 and (metadata or {}).get("job_id") and scheduled_template
+                            and err.startswith("graph error 131047 ")):
+                        return await self.send_template(chat_id, content, scheduled_template, metadata=metadata)
+                    return SendResult(success=False, error=err)
+                last_message_id = ids[0].get("id") if ids else last_message_id
+                if (idx == 0 and last_message_id and (metadata or {}).get("job_id") and scheduled_template
+                        and len(" ".join(content.split())) <= 1024 and len(formatted) <= self._outgoing_chunk_limit()):
+                    await asyncio.to_thread(whatsapp_chat_window.remember_send, self._window_home,
+                                            self._phone_number_id, chat_id, last_message_id, content,
+                                            scheduled_template, (metadata or {}).get("job_name"))
+                    await self._retry_window_rejection(chat_id, last_message_id)
         # Index (chat_id, wamid) → text: Meta's inbound ``context`` carries only the
         # quoted message's id, so this is how replies to our messages resolve text.
         if last_message_id:

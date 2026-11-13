@@ -20,11 +20,11 @@ def validate_reply(conn, obligation_id, adapter):
     row = conn.execute('SELECT * FROM delivery_obligations WHERE obligation_id=?', (obligation_id,)).fetchone()
     if not row or row['state'] != 'failed' or row['source_binding'] or row['native_message_id']:
         raise ValueError('Only an unclaimed definitively failed native reply can be recovered')
-    if row['platform'] != 'whatsapp_cloud' or row['adapter_profile'] != 'default':
-        raise ValueError('Recovery supports the owning default WhatsApp Cloud profile only')
+    if row['platform'] not in {'whatsapp_cloud','discord'} or row['adapter_profile'] != 'default':
+        raise ValueError('Recovery supports the owning default WhatsApp Cloud/Discord profile only')
     if 'outbound held:' not in (row['last_error'] or '').lower():
         raise ValueError('Failure is not a definitive local policy hold')
-    if not adapter._is_dm_allowed(row['chat_id']):
+    if row['platform'] == 'whatsapp_cloud' and not adapter._is_dm_allowed(row['chat_id']):
         raise ValueError('Recipient is no longer authorized by the native adapter')
     matches = conn.execute("""SELECT m.*,s.source,s.user_id,s.chat_id,s.chat_type,s.session_key,s.origin_json
         FROM messages m JOIN sessions s ON s.id=m.session_id
@@ -35,10 +35,13 @@ def validate_reply(conn, obligation_id, adapter):
         raise ValueError('Exact persisted final reply is missing or ambiguous')
     reply = matches[0]
     origin = json.loads(reply['origin_json'] or '{}')
-    if (reply['source'] != 'whatsapp_cloud' or reply['chat_type'] != 'dm'
-            or str(reply['user_id']) != row['chat_id'] or str(reply['chat_id']) != row['chat_id']
-            or str(origin.get('user_id')) != row['chat_id'] or str(origin.get('chat_id')) != row['chat_id']
-            or origin.get('platform') != 'whatsapp_cloud'):
+    actor = row['chat_id'] if row['platform']=='whatsapp_cloud' else '446319827712475137'
+    if (reply['source'] != row['platform']
+            or str(reply['user_id']) != actor or str(reply['chat_id']) != row['chat_id']
+            or str(origin.get('user_id')) != actor or str(origin.get('chat_id')) != row['chat_id']
+            or origin.get('platform') != row['platform']
+            or str(origin.get('thread_id') or '') != str(row['thread_id'] or '')
+            or (row['platform']=='whatsapp_cloud' and reply['chat_type']!='dm')):
         raise ValueError('Persisted native source does not bind this recipient')
     inbound = conn.execute("""SELECT * FROM messages WHERE session_id=? AND role='user'
         AND id<? AND active=1 ORDER BY id DESC LIMIT 1""", (reply['session_id'],reply['id'])).fetchone()
@@ -46,7 +49,9 @@ def validate_reply(conn, obligation_id, adapter):
         raise ValueError('Original native inbound is missing')
     if ledger.compute_obligation_id(row['session_key'],inbound['platform_message_id'],row['content']) != obligation_id:
         raise ValueError('Obligation digest does not bind the original native inbound and exact final output')
-    return dict(row), dict(inbound)
+    verified=dict(row)
+    verified['authenticated_actor']=actor
+    return verified, dict(inbound)
 
 
 @contextmanager
@@ -54,7 +59,7 @@ def _native_reply_scope(row, inbound):
     from gateway import outbound_policy as policy
     from hermes_constants import get_hermes_home
     proof = {'kind':'authenticated_reply','home_scope':str(get_hermes_home()),
-             'platform':'whatsapp_cloud','user_id':row['chat_id'],'recipient':row['chat_id'],
+             'platform':row['platform'],'user_id':row['authenticated_actor'],'recipient':str(row['thread_id'] or row['chat_id']),
              'message_id':inbound['platform_message_id'],'source_text':inbound['content']}
     digest = policy._text_digest(row['content'])
     token = policy._provenance.set(lambda: dict(proof, _formatted_output_sha256s=(digest,)))
@@ -70,7 +75,7 @@ async def retry_reply(obligation_id, adapter, *, send=False):
     with ledger._DB_LOCK, ledger._transaction() as conn:
         row, inbound = validate_reply(conn,obligation_id,adapter)
         with _native_reply_scope(row,inbound):
-            admission = evaluate('whatsapp_cloud',row['chat_id'],row['content'],profile_home=adapter._outbound_policy_home)
+            admission = evaluate(row['platform'],str(row['thread_id'] or row['chat_id']),row['content'],profile_home=adapter._outbound_policy_home)
         if admission.get('allow') is not True:
             return admission
         if not send:
@@ -85,7 +90,7 @@ async def retry_reply(obligation_id, adapter, *, send=False):
     # Once reserved, every uncertain outcome remains unknown. Never automatically duplicate it.
     with _native_reply_scope(row,inbound):
         result = await adapter.send(row['chat_id'],row['content'],
-                                    reply_to=inbound['platform_message_id'])
+                                    reply_to=inbound['platform_message_id'],metadata={'thread_id':row['thread_id']} if row['thread_id'] else None)
     if not result.success or not result.message_id:
         return {'success':False,'state':'unknown','delivered':False,'error':result.error or 'Missing native receipt',
                 'obligation_id':obligation_id}
@@ -95,6 +100,23 @@ async def retry_reply(obligation_id, adapter, *, send=False):
     logging.getLogger('gateway.run').info('Recovered authenticated reply obligation=%s native_receipt=%s',
                                           obligation_id,result.message_id)
     return {'success':True,'state':'delivered','delivered':True,'message_id':result.message_id,'obligation_id':obligation_id}
+
+
+class DiscordRecoveryAdapter:
+    """Reuse the registered Discord standalone sender; no second gateway or bot login."""
+    def __init__(self, config):
+        from hermes_constants import get_hermes_home
+        self.config=config
+        self._outbound_policy_home=get_hermes_home()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        from gateway.platforms.base import SendResult
+        from plugins.platforms.discord.adapter import _standalone_send
+        # A verified existing channel/thread is already known, so do not create a forum post.
+        result=await _standalone_send(self.config,chat_id,content,
+                                      thread_id=str((metadata or {}).get('thread_id') or chat_id))
+        return SendResult(success=result.get('success') is True,message_id=result.get('message_id'),
+                          error=result.get('error'))
 
 
 def main():
@@ -114,7 +136,14 @@ def main():
         from hermes_cli.send_cmd import _load_hermes_env
         set_secret_scope(build_profile_secret_scope(get_hermes_home()),profile_home=str(get_hermes_home()))
         _load_hermes_env()
-        config = load_gateway_config().platforms[Platform.WHATSAPP_CLOUD]
+        with ledger._transaction() as conn:
+            native = conn.execute('SELECT platform FROM delivery_obligations WHERE obligation_id=?',(args.obligation,)).fetchone()
+        if not native:
+            raise ValueError('Unknown obligation')
+        platform=Platform(native[0])
+        config = load_gateway_config().platforms[platform]
+        if platform==Platform.DISCORD:
+            return await retry_reply(args.obligation,DiscordRecoveryAdapter(config),send=args.send)
         adapter = WhatsAppCloudAdapter(config)
         if not adapter._phone_number_id or not adapter._access_token:
             raise ValueError('Native WhatsApp Cloud credentials unavailable')

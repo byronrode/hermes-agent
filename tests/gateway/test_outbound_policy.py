@@ -92,13 +92,15 @@ def test_native_sdk_and_followup_session_cannot_bypass_policy(tmp_path):
     assert all('Builder' not in str(payload) for payload in emitted)
 
 
-def test_whatsapp_reply_survives_native_handler_and_formatter_handoff(tmp_path, monkeypatch):
+@pytest.mark.parametrize("startup_replay", [False, True], ids=["normal-inbound", "startup-queued-inbound"])
+def test_whatsapp_reply_survives_native_handler_and_formatter_handoff(tmp_path, monkeypatch, startup_replay):
     """Real Base -> gateway wrapper -> Cloud.send with a sanitized long-turn envelope."""
     import httpx
     from unittest.mock import AsyncMock
     from gateway.config import PlatformConfig
     from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
     from gateway.run_turn import GatewayTurnMixin
+    from gateway.run_startup import GatewayStartupMixin
     from gateway.session import build_session_key
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     import gateway.outbound_policy as policy
@@ -139,7 +141,20 @@ def test_whatsapp_reply_survives_native_handler_and_formatter_handoff(tmp_path, 
                    'text': {'body': 'Please prepare a draft for my review.'}}
             event = await adapter._build_message_event_from_cloud(raw, {}, {'phone_number_id': '123'})
             assert event is not None
-            await adapter.handle_message(event)
+            if startup_replay:
+                class StartupRunner(GatewayStartupMixin):
+                    _startup_restore_queue = None
+                    def _intake_adapter_for(self, source):
+                        return adapter
+                startup = StartupRunner()
+                startup._queue_startup_restore_event(event)
+                assert startup._startup_restore_queue == [event]
+                assert adapter._http_client.post.call_count == 0
+                assert await startup._drain_startup_restore_queue() == 1
+                assert event._hermes_startup_restore_replay is True
+                assert not startup._startup_restore_queue
+            else:
+                await adapter.handle_message(event)
             tasks = list(adapter._session_tasks.values())
             if tasks:
                 await asyncio.gather(*tasks)

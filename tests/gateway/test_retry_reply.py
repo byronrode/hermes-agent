@@ -37,7 +37,7 @@ def test_native_held_reply_recovery_exact_once(tmp_path, monkeypatch, platform):
         ledger.record_obligation(obligation_id=oid,session_key=key,platform=platform,chat_id=chat,thread_id=None,content=content)
         ledger.mark_failed(oid,'outbound held: WhatsApp only authenticated reply')
         with ledger._transaction() as conn:
-            conn.execute('UPDATE delivery_obligations SET created_at=100,attempts=3 WHERE obligation_id=?',(oid,))
+            conn.execute('UPDATE delivery_obligations SET created_at=108,attempts=3 WHERE obligation_id=?',(oid,))
         adapter=WhatsAppCloudAdapter(PlatformConfig(enabled=True,extra={'phone_number_id':'123','access_token':'fake'}))
         adapter._allow_from={'27840000000'}
         adapter._dm_policy='allowlist'

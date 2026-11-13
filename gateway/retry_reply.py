@@ -29,7 +29,7 @@ def validate_reply(conn, obligation_id, adapter):
     matches = conn.execute("""SELECT m.*,s.source,s.user_id,s.chat_id,s.chat_type,s.session_key,s.origin_json
         FROM messages m JOIN sessions s ON s.id=m.session_id
         WHERE s.session_key=? AND m.role='assistant' AND m.content=?
-        AND abs(m.timestamp-?)<5 AND m.active=1""",
+        AND abs(m.timestamp-?)<60 AND m.active=1""",
         (row['session_key'], row['content'], row['created_at'])).fetchall()
     if len(matches) != 1:
         raise ValueError('Exact persisted final reply is missing or ambiguous')

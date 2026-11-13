@@ -284,6 +284,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP)
+        from hermes_constants import get_hermes_home
+        self._outbound_policy_home = get_hermes_home()
         if WhatsAppAdapter._DEFAULT_BRIDGE_DIR is None:
             from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
             WhatsAppAdapter._DEFAULT_BRIDGE_DIR = resolve_whatsapp_bridge_dir()
@@ -317,6 +319,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     def _bridge_req(self, method: str, path: str, timeout: float, **kwargs):
         """``session.<method>`` context manager for a bridge endpoint (caller must ``async with``)."""
+        if method.lower() == 'post' and path in {'send', 'send-media', 'edit'}:
+            from gateway.outbound_policy import evaluate, OutboundHeld
+            payload = kwargs.get('json') or {}
+            receipt = evaluate('whatsapp', str(payload.get('chatId', '')),
+                               str(payload.get('message') or payload.get('caption') or ''),
+                               profile_home=getattr(self, '_outbound_policy_home', None))
+            if receipt.get('allow') is not True:
+                raise OutboundHeld(receipt)
         import aiohttp
         return getattr(self._http_session, method)(self._bridge_url(path), **kwargs, timeout=aiohttp.ClientTimeout(total=timeout))
 
@@ -934,6 +944,10 @@ def _normalize_outbound_mentions(mentions: list[str] | None) -> list[str]:
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False,
                            caption=None, mentions=None):
     """Out-of-process delivery via the bridge HTTP API (standalone_sender_fn: cron apart from the gateway); ``caption`` rides on the media bubble."""
+    from gateway.outbound_policy import evaluate
+    receipt = evaluate('whatsapp', str(chat_id), message or caption or '')
+    if receipt.get('allow') is not True:
+        return receipt
     try:
         import aiohttp
     except ImportError:

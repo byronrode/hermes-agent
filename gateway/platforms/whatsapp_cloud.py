@@ -157,6 +157,10 @@ _INBOUND_MEDIA_CACHE = Path(get_hermes_dir("platforms/whatsapp_cloud/media", "wh
 
 async def send_whatsapp_cloud_standalone(config, chat_id, content, *, metadata=None):
     """Use the normal outbound adapter without starting a second webhook listener."""
+    from gateway.outbound_policy import evaluate
+    receipt = evaluate('whatsapp_cloud', str(chat_id), content)
+    if receipt.get('allow') is not True:
+        return receipt
     adapter = WhatsAppCloudAdapter(config)
     if not adapter._phone_number_id or not adapter._access_token:
         return {"error": "WhatsApp Cloud phone number ID and access token are required"}
@@ -185,6 +189,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP_CLOUD)
+        from hermes_constants import get_hermes_home
+        self._outbound_policy_home = get_hermes_home()
         extra = config.extra or {}
         self._phone_number_id, self._access_token, self._app_id, self._app_secret, self._waba_id, self._verify_token = (
             str(extra.get(key, "")).strip()
@@ -339,6 +345,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def _post_messages(self, payload: Dict[str, Any], *, fail_log: str, reject_log: str, reject_args: tuple = ()) -> tuple[list, Optional[str]]:
         """POST one /messages payload. Returns ``(response messages[], None)`` or ``([], error)``."""
+        from gateway.outbound_policy import evaluate
+        block = payload.get(payload.get('type'), {})
+        content = (block.get('body') or block.get('caption') or
+                   (block.get('body', {}).get('text') if isinstance(block.get('body'), dict) else '') or '')
+        if isinstance(content, dict):
+            content = content.get('text', '')
+        receipt = evaluate('whatsapp_cloud', str(payload.get('to', '')), str(content),
+                           controls=block.get('action'), profile_home=self._outbound_policy_home)
+        if receipt.get('allow') is not True:
+            return [], 'outbound held: ' + receipt.get('reason', 'policy refused delivery')
         try:
             resp = await self._http_client.post(self._graph_url("messages"), headers=self._auth_headers(), json=payload)
         except Exception as exc:
@@ -372,6 +388,12 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """Send a text message via Graph API. ``chat_id`` is the recipient's ``wa_id``."""
         if self._http_client is None:
             return SendResult(success=False, error="Not connected")
+        from gateway.outbound_policy import evaluate
+        receipt = evaluate('whatsapp_cloud', str(chat_id), content, profile_home=self._outbound_policy_home,
+                           test=bool((metadata or {}).get('test')), probe=bool((metadata or {}).get('probe')),
+                           dry_run=bool((metadata or {}).get('dry_run')))
+        if receipt.get('allow') is not True:
+            return SendResult(success=False, error=receipt['error'], raw_response=receipt)
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
         scheduled_template = (self.config.extra or {}).get("scheduled_template")

@@ -1306,6 +1306,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 allowed_mentions=_build_allowed_mentions(getattr(self.config, "extra", None)),
                 **proxy_kwargs_for_bot(proxy_url),
             )
+            from gateway.outbound_policy import install_discord_transport
+            from hermes_constants import get_hermes_home
+            self._outbound_policy_home = get_hermes_home()
+            install_discord_transport(self._client, profile_home=self._outbound_policy_home)
             # Fresh connection, fresh dispatch-side silence window: the previous client's last
             # DISPATCH stamp must not leak into this connection's liveness samples (#109521).
             # READY itself is a DISPATCH event, so a healthy connection stamps almost immediately.
@@ -3038,6 +3042,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     ) -> SendResult:
         """Send a message to a Discord channel or thread (metadata thread_id wins over
         chat_id; forum channels auto-create a thread post since they reject direct sends)."""
+        from gateway.outbound_policy import evaluate
+        receipt = evaluate('discord', str((metadata or {}).get('thread_id') or chat_id), content,
+                           profile_home=getattr(self, '_outbound_policy_home', None),
+                           test=bool((metadata or {}).get('test')), probe=bool((metadata or {}).get('probe')),
+                           dry_run=bool((metadata or {}).get('dry_run')))
+        if receipt.get('allow') is not True:
+            return SendResult(success=False, error=receipt['error'], raw_response=receipt)
         if not self._client:
             # Dead transport: classify as send_path_degraded so the delivery ledger's reconnect
             # sweep can replay this; a generic "Not connected" error would strand the output.
@@ -7049,6 +7060,10 @@ async def _standalone_send(
     Forum channels (type 15) reject ``POST /messages``, so a thread post is created via
     ``POST /channels/{id}/threads`` with media as multipart attachments. Channel type: directory
     cache → process-local probe cache → memoized GET. ``force_document`` accepted but unused."""
+    from gateway.outbound_policy import evaluate
+    receipt = evaluate('discord', str(thread_id or chat_id), message or caption or '')
+    if receipt.get('allow') is not True:
+        return receipt
     try:
         import aiohttp
     except ImportError:

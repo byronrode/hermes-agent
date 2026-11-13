@@ -98,6 +98,9 @@ async def retry_reply(obligation_id, adapter, *, send=False):
 
 
 def main():
+    logger = logging.getLogger('gateway.run')
+    logger.setLevel(logging.INFO)
+    logger.addHandler(logging.StreamHandler())
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--obligation',required=True)
     parser.add_argument('--send',action='store_true',help='Reserve and deliver this verified exact reply once')

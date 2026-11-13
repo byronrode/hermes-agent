@@ -42,6 +42,11 @@ def test_native_sdk_and_followup_session_cannot_bypass_policy(tmp_path):
         for method in ('POST', 'PATCH'):
             with pytest.raises(OutboundHeld):
                 await http.request(SimpleNamespace(method=method, channel_id='person'), json={'content': 'Builder output'})
+        for hidden in ({'embeds': [{'fields': [{'name': 'Builder field', 'value': 'Builder report'}]}]},
+                       {'embeds': [{'footer': {'text': 'Builder footer'}}]},
+                       {'attachments': [{'filename': 'Builder attachment'}]}):
+            with pytest.raises(OutboundHeld):
+                await http.request(SimpleNamespace(method='POST', channel_id='person'), json=hidden)
         await http.request(SimpleNamespace(method='POST', channel_id='person'), json={'content': 'Useful decision'})
         with pytest.raises(OutboundHeld):
             await session._request('POST', 'https://discord.com/api/v10/webhooks/id/token', json={'content': 'Builder followup'})

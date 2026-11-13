@@ -59,10 +59,19 @@ def _discord_body(payload):
         body = body['message']
     if not any(key in body for key in ('content', 'embeds', 'components', 'attachments')):
         return None
-    text = str(body.get('content') or '')
-    text += '\n'.join(str(embed.get(key) or '') for embed in body.get('embeds') or []
-                      for key in ('title', 'description'))
-    return text, body.get('components')
+    visible_keys = {'content', 'title', 'description', 'text', 'name', 'value', 'label',
+                    'filename', 'caption', 'placeholder', 'url'}
+    def visible(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in visible_keys and isinstance(child, str):
+                    yield child
+                elif isinstance(child, (dict, list)):
+                    yield from visible(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from visible(child)
+    return '\n'.join(visible(body)), body.get('components')
 
 
 def install_discord_transport(client, *, profile_home):

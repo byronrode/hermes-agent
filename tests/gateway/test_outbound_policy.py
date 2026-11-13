@@ -19,6 +19,29 @@ def test_required_policy_is_profile_scoped_and_fails_closed(tmp_path):
     assert evaluate('discord', 'person', 'Builder output', profile_home=second)['allow'] is True
     assert evaluate('discord', 'person', 'Builder output', profile_home=first)['allow'] is not True
     assert evaluate('discord', 'person', 'Useful decision', profile_home=first)['allow'] is True
+    from gateway.outbound_policy import (authorized_reply_scope, current_provenance,
+        retain_final_reply, reply_handoff, authorized_cron_scope, cron_fingerprint)
+    source = SimpleNamespace(platform=SimpleNamespace(value='whatsapp_cloud'), user_id='person',
+                             chat_id='person', is_bot=False)
+    event = SimpleNamespace(internal=False, message_id='native-message', text='When is it?',
+                            raw_message={'id': 'native-message', 'from': 'person'})
+    runner = SimpleNamespace(_is_session_run_current=lambda *args: True,
+                             _is_user_authorized_for_source=lambda *args, **kwargs: True)
+    with authorized_reply_scope(runner, event, source, 'session', 1):
+        assert current_provenance('Answer')['kind'] == 'authenticated_reply'
+        retain_final_reply('Exact answer')
+    assert current_provenance('Answer') is None
+    assert reply_handoff('whatsapp_cloud', 'person', 'Changed answer') is None
+    assert reply_handoff('whatsapp_cloud', 'person', 'Exact answer', consume=True)['message_id'] == 'native-message'
+    assert reply_handoff('whatsapp_cloud', 'person', 'Exact answer') is None
+    event.raw_message['from'] = 'forged'
+    with authorized_reply_scope(runner, event, source, 'session', 1):
+        assert current_provenance('Answer') is None
+    job = {'id': 'standing-job', 'prompt': 'Take the medicine', 'deliver': 'whatsapp_cloud'}
+    with authorized_cron_scope(job, 'Take the medicine'):
+        assert current_provenance('Take the medicine')['job_sha256'] == cron_fingerprint(job)
+        assert current_provenance('Unrelated announcement') is None
+    assert current_provenance('Take the medicine') is None
     callback.unlink()
     held = evaluate('discord', 'person', 'Useful decision', profile_home=first)
     assert held['state'] == 'held' and held['delivered'] is False

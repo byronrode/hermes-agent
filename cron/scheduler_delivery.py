@@ -1912,6 +1912,14 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
 def _deliver_result(
     job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
 ) -> Optional[str]:
+    from gateway.outbound_policy import authorized_cron_scope
+    with authorized_cron_scope(job, content):
+        return _deliver_result_owned(job, content, adapters, loop, for_failure=for_failure)
+
+
+def _deliver_result_owned(
+    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
+) -> Optional[str]:
     """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's

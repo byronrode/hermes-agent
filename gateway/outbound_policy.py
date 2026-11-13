@@ -42,8 +42,10 @@ def evaluate(platform: str, recipient: str, content: str, *, controls=None,
         spec.loader.exec_module(module)
         receipt = module.decide({'platform': platform, 'recipient': str(recipient), 'content': content,
             'controls': controls, 'dry_run': dry_run, 'operation': operation, 'test': test, 'probe': probe,
-            'profile_home': str(home)}, settings=policy.get('settings') or {})
+            'profile_home': str(home), 'provenance': (current_provenance(content) or reply_handoff(platform, recipient, content))}, settings=policy.get('settings') or {})
         if isinstance(receipt, dict) and receipt.get('allow') is True:
+            if operation == 'emit':
+                reply_handoff(platform, recipient, content, consume=True)
             return receipt
         return {**(receipt if isinstance(receipt, dict) else {}),
                 **held(receipt.get('reason', 'outbound policy held the message') if isinstance(receipt, dict) else 'outbound policy held the message')}
@@ -137,3 +139,117 @@ def install_discord_transport(client, *, profile_home):
             admitted.reset(token)
     request._hermes_outbound_guard = True
     client.http.request = request
+
+
+# These custody scopes are entered by the native gateway/cron owners, never by
+# caller metadata. Their resolver revalidates the live source before every send.
+from contextlib import contextmanager
+from contextvars import ContextVar
+import hashlib
+
+_provenance = ContextVar('outbound_delivery_provenance', default=None)
+
+
+def _text_digest(text):
+    return hashlib.sha256(' '.join(str(text).split()).encode()).hexdigest()
+
+
+def cron_fingerprint(job):
+    keys = ('id', 'name', 'prompt', 'schedule', 'deliver', 'deliver_extra', 'profile', 'script', 'no_agent')
+    return hashlib.sha256(json.dumps({key: job.get(key) for key in keys}, sort_keys=True,
+                                    separators=(',', ':'), default=str).encode()).hexdigest()
+
+
+@contextmanager
+def authorized_cron_scope(job, content):
+    active = True
+    identity = {'kind': 'personal_reminder', 'job_id': str(job.get('id') or ''),
+                'job_sha256': cron_fingerprint(job), 'output_sha256': _text_digest(content)}
+    token = _provenance.set(lambda: dict(identity) if active else None)
+    try:
+        yield
+    finally:
+        active = False
+        _provenance.reset(token)
+
+
+@contextmanager
+def authorized_reply_scope(runner, event, source, session_key, generation):
+    active = True
+    platform = getattr(getattr(source, 'platform', None), 'value', str(getattr(source, 'platform', '')))
+    actor, recipient = str(source.user_id or ''), str(source.chat_id or '')
+    message_id = str(getattr(event, 'message_id', '') or '')
+    original = str(getattr(event, 'text', '') or '')
+    raw = getattr(event, 'raw_message', None)
+    home = None
+    from hermes_constants import get_hermes_home
+    home = str(get_hermes_home())
+    def resolve():
+        if (not active or event is None or getattr(event, 'internal', False)
+                or getattr(source, 'is_bot', False) or not message_id
+                or str(get_hermes_home()) != home
+                or not runner._is_session_run_current(session_key, generation)
+                or not runner._is_user_authorized_for_source(source, allow_adapter_delegation=False)
+                or str(source.user_id or '') != actor or str(source.chat_id or '') != recipient
+                or str(getattr(event, 'message_id', '') or '') != message_id
+                or str(getattr(event, 'text', '') or '') != original):
+            return None
+        if platform == 'whatsapp_cloud':
+            if not isinstance(raw, dict) or str(raw.get('id', '')) != message_id or str(raw.get('from', '')) != actor:
+                return None
+        elif platform == 'discord':
+            adapter = runner._intake_adapter_for(source)
+            reader = getattr(adapter, 'source_event_identity', None)
+            if not callable(reader) or not reader(event):
+                return None
+        else:
+            return None
+        return {'kind': 'authenticated_reply', 'platform': platform, 'user_id': actor,
+                'recipient': recipient, 'message_id': message_id, 'source_text': original}
+    token = _provenance.set(resolve)
+    try:
+        yield
+    finally:
+        active = False
+        _provenance.reset(token)
+
+
+def current_provenance(content):
+    reader = _provenance.get()
+    proof = reader() if callable(reader) else None
+    if proof and proof.get('kind') == 'personal_reminder' and proof.get('output_sha256') != _text_digest(content):
+        return None
+    return proof
+
+
+# A final response returns from the authenticated handler before the adapter
+# emits it. Retain only this exact output/recipient for that short handoff.
+import time
+import threading
+_reply_grants = {}
+_reply_grants_lock = threading.Lock()
+
+
+def retain_final_reply(content):
+    proof = current_provenance(content)
+    if not proof or proof.get('kind') != 'authenticated_reply':
+        return
+    key = (proof['platform'], proof['recipient'].lstrip('+'), _text_digest(content))
+    with _reply_grants_lock:
+        now = time.monotonic()
+        for old, (_value, deadline) in list(_reply_grants.items()):
+            if deadline < now:
+                _reply_grants.pop(old, None)
+        _reply_grants[key] = (proof, now + 60)
+
+
+def reply_handoff(platform, recipient, content, *, consume=False):
+    key = (platform, str(recipient).lstrip('+'), _text_digest(content))
+    with _reply_grants_lock:
+        value = _reply_grants.get(key)
+        if not value or value[1] < time.monotonic():
+            _reply_grants.pop(key, None)
+            return None
+        if consume:
+            _reply_grants.pop(key, None)
+        return dict(value[0])

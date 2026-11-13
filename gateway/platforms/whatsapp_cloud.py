@@ -351,8 +351,12 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                    (block.get('body', {}).get('text') if isinstance(block.get('body'), dict) else '') or '')
         if isinstance(content, dict):
             content = content.get('text', '')
+        if payload.get('type') == 'template':
+            content = '\n'.join(str(parameter.get('text') or '')
+                for component in block.get('components', []) if component.get('type') == 'body'
+                for parameter in component.get('parameters', []) if parameter.get('type') == 'text')
         receipt = evaluate('whatsapp_cloud', str(payload.get('to', '')), str(content),
-                           controls=block.get('action'), profile_home=self._outbound_policy_home)
+                           controls=block.get('action'), profile_home=self._outbound_policy_home, operation='emit')
         if receipt.get('allow') is not True:
             return [], 'outbound held: ' + receipt.get('reason', 'policy refused delivery')
         try:

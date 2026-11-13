@@ -2152,6 +2152,15 @@ class GatewayTurnMixin:
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+        from gateway.outbound_policy import authorized_reply_scope
+        with authorized_reply_scope(self, event, source, _quick_key, run_generation):
+            response = await self._handle_message_with_agent_owned(event, source, _quick_key, run_generation)
+            if isinstance(response, str):
+                from gateway.outbound_policy import retain_final_reply
+                retain_final_reply(response)
+            return response
+
+    async def _handle_message_with_agent_owned(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)

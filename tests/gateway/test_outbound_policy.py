@@ -32,6 +32,7 @@ def test_required_policy_is_profile_scoped_and_fails_closed(tmp_path):
         retain_final_reply('Exact answer')
     assert current_provenance('Answer') is None
     assert reply_handoff('whatsapp_cloud', 'person', 'Changed answer') is None
+    assert reply_handoff('whatsapp_cloud', 'person', 'Exact answer', profile_home=second) is None
     assert reply_handoff('whatsapp_cloud', 'person', 'Exact answer', consume=True)['message_id'] == 'native-message'
     assert reply_handoff('whatsapp_cloud', 'person', 'Exact answer') is None
     event.raw_message['from'] = 'forged'
@@ -42,6 +43,10 @@ def test_required_policy_is_profile_scoped_and_fails_closed(tmp_path):
         assert current_provenance('Take the medicine')['job_sha256'] == cron_fingerprint(job)
         assert current_provenance('Unrelated announcement') is None
     assert current_provenance('Take the medicine') is None
+    with authorized_cron_scope(job, 'Could not run the reminder', for_failure=True):
+        assert current_provenance('Could not run the reminder') is None
+    callback.write_text("def decide(event, settings=None):\n return {'allow': not event.get('test')}\n")
+    assert evaluate('discord', 'Byron', 'Useful plausible decision', profile_home=first)['allow'] is not True
     callback.unlink()
     held = evaluate('discord', 'person', 'Useful decision', profile_home=first)
     assert held['state'] == 'held' and held['delivered'] is False

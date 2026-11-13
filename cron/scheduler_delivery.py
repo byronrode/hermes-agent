@@ -1913,7 +1913,7 @@ def _deliver_result(
     job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
 ) -> Optional[str]:
     from gateway.outbound_policy import authorized_cron_scope
-    with authorized_cron_scope(job, content):
+    with authorized_cron_scope(job, content, for_failure=for_failure):
         return _deliver_result_owned(job, content, adapters, loop, for_failure=for_failure)
 
 

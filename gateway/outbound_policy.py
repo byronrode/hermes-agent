@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -40,12 +41,15 @@ def evaluate(platform: str, recipient: str, content: str, *, controls=None,
         spec = importlib.util.spec_from_file_location('hermes_profile_outbound_policy', source)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        provenance = current_provenance(content) or reply_handoff(platform, recipient, content, profile_home=home)
+        if provenance and provenance.get('home_scope') != str(home):
+            provenance = None
         receipt = module.decide({'platform': platform, 'recipient': str(recipient), 'content': content,
-            'controls': controls, 'dry_run': dry_run, 'operation': operation, 'test': test, 'probe': probe,
-            'profile_home': str(home), 'provenance': (current_provenance(content) or reply_handoff(platform, recipient, content))}, settings=policy.get('settings') or {})
+            'controls': controls, 'dry_run': dry_run, 'operation': operation, 'test': test or bool(os.environ.get('PYTEST_CURRENT_TEST')), 'probe': probe,
+            'profile_home': str(home), 'provenance': provenance}, settings=policy.get('settings') or {})
         if isinstance(receipt, dict) and receipt.get('allow') is True:
             if operation == 'emit':
-                reply_handoff(platform, recipient, content, consume=True)
+                reply_handoff(platform, recipient, content, consume=True, profile_home=home)
             return receipt
         return {**(receipt if isinstance(receipt, dict) else {}),
                 **held(receipt.get('reason', 'outbound policy held the message') if isinstance(receipt, dict) else 'outbound policy held the message')}
@@ -161,11 +165,12 @@ def cron_fingerprint(job):
 
 
 @contextmanager
-def authorized_cron_scope(job, content):
+def authorized_cron_scope(job, content, *, for_failure=False):
     active = True
-    identity = {'kind': 'personal_reminder', 'job_id': str(job.get('id') or ''),
+    from hermes_constants import get_hermes_home
+    identity = {'kind': 'personal_reminder', 'home_scope': str(get_hermes_home()), 'job_id': str(job.get('id') or ''),
                 'job_sha256': cron_fingerprint(job), 'output_sha256': _text_digest(content)}
-    token = _provenance.set(lambda: dict(identity) if active else None)
+    token = _provenance.set(lambda: dict(identity) if active and not for_failure else None)
     try:
         yield
     finally:
@@ -204,7 +209,7 @@ def authorized_reply_scope(runner, event, source, session_key, generation):
                 return None
         else:
             return None
-        return {'kind': 'authenticated_reply', 'platform': platform, 'user_id': actor,
+        return {'kind': 'authenticated_reply', 'home_scope': home, 'platform': platform, 'user_id': actor,
                 'recipient': recipient, 'message_id': message_id, 'source_text': original}
     token = _provenance.set(resolve)
     try:
@@ -234,7 +239,7 @@ def retain_final_reply(content):
     proof = current_provenance(content)
     if not proof or proof.get('kind') != 'authenticated_reply':
         return
-    key = (proof['platform'], proof['recipient'].lstrip('+'), _text_digest(content))
+    key = (proof['home_scope'], proof['platform'], proof['recipient'].lstrip('+'), _text_digest(content))
     with _reply_grants_lock:
         now = time.monotonic()
         for old, (_value, deadline) in list(_reply_grants.items()):
@@ -243,8 +248,9 @@ def retain_final_reply(content):
         _reply_grants[key] = (proof, now + 60)
 
 
-def reply_handoff(platform, recipient, content, *, consume=False):
-    key = (platform, str(recipient).lstrip('+'), _text_digest(content))
+def reply_handoff(platform, recipient, content, *, consume=False, profile_home=None):
+    from hermes_constants import get_hermes_home
+    key = (str(profile_home or get_hermes_home()), platform, str(recipient).lstrip('+'), _text_digest(content))
     with _reply_grants_lock:
         value = _reply_grants.get(key)
         if not value or value[1] < time.monotonic():

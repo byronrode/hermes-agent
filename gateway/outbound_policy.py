@@ -105,14 +105,17 @@ def install_discord_transport(client, *, profile_home):
                 if body is None and kwargs.get('data') is not None:
                     # Direct webhook multipart must expose its plain payload before emission.
                     data = kwargs['data']
+                    parsed_payload = False
                     if isinstance(data, str):
                         body = _discord_body(json.loads(data))
+                        parsed_payload = True
                     else:
                         for options, _headers, value in getattr(data, '_fields', []):
                             if options.get('name') == 'payload_json':
                                 body = _discord_body(json.loads(value))
+                                parsed_payload = True
                                 break
-                    if body is None:
+                    if body is None and not parsed_payload:
                         receipt = evaluate('discord', '', '', profile_home=profile_home)
                         if receipt.get('allow') is not True:
                             raise OutboundHeld(receipt)

@@ -8,6 +8,32 @@ import pytest
 from gateway.outbound_policy import evaluate, install_discord_transport, OutboundHeld
 
 
+def test_discord_serialized_acknowledgements_reach_transport_without_message_admission(tmp_path):
+    callback = tmp_path / 'policy.py'
+    callback.write_text("def decide(event, settings=None):\n return {'allow': False, 'reason': 'real message held'}\n")
+    (tmp_path / 'config.yaml').write_text(json.dumps({'outbound_policy': {
+        'required': True, 'callback_file': str(callback)}}))
+    async def transport(*args, **kwargs):
+        return 'acknowledged'
+    session = SimpleNamespace(closed=False, _request=transport)
+    http = SimpleNamespace(request=transport, _HTTPClient__session=session)
+    install_discord_transport(SimpleNamespace(http=http), profile_home=tmp_path)
+    async def scenario():
+        await http.request(SimpleNamespace(method='GET'))
+        for kind in (5, 6, 8, 9):
+            assert await session._request('POST', 'https://discord.com/api/interactions/id/token/callback',
+                data=json.dumps({'type': kind, 'data': {'flags': 64}})) == 'acknowledged'
+        assert session._request.__name__ == 'session_request'
+        with pytest.raises(OutboundHeld):
+            await session._request('POST', 'https://discord.com/api/interactions/id/token/callback',
+                data=json.dumps({'type': 4, 'data': {'content': 'Unsolicited report'}}))
+        with pytest.raises(OutboundHeld):
+            await session._request('POST', 'https://discord.com/api/webhooks/id/token',
+                data=json.dumps({'content': 'Unsolicited followup'}))
+    asyncio.run(scenario())
+    assert session._request._hermes_outbound_guard
+
+
 def test_required_policy_is_profile_scoped_and_fails_closed(tmp_path):
     callback = tmp_path / 'policy.py'
     callback.write_text("def decide(event, settings=None):\n return {'allow': event['content'].startswith('Useful')}\n")

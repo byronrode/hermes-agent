@@ -78,3 +78,59 @@ def test_native_held_reply_recovery_exact_once(tmp_path, monkeypatch, platform):
             assert row==('delivered','provider-receipt',4)
     finally:
         reset_hermes_home_override(home)
+
+
+@pytest.mark.parametrize('platform',['whatsapp_cloud','discord'])
+def test_operator_followup_native_custody_and_uncertain_dedup(tmp_path,monkeypatch,platform):
+    from gateway import delivery_ledger as ledger
+    from gateway.outbound_policy import current_provenance
+    from gateway.platforms.base import SendResult
+    from gateway.retry_reply import follow_up
+    from hermes_constants import set_hermes_home_override,reset_hermes_home_override
+    monkeypatch.setattr(ledger,'_db_path',lambda:tmp_path/'state.db')
+    callback=tmp_path/'followup_policy.py'
+    callback.write_text("def decide(event, settings=None):\n p=event.get('provenance') or {}\n return {'allow': event['platform']=='discord' and not p or p.get('message_id')=='wamid.native'}\n")
+    (tmp_path/'config.yaml').write_text(json.dumps({'outbound_policy':{'required':True,'callback_file':str(callback)}}))
+    home=set_hermes_home_override(tmp_path)
+    sent=[]
+    class Native:
+        _outbound_policy_home=tmp_path
+        def _is_dm_allowed(self,actor):
+            return actor=='27840000000'
+        async def send(self,chat,content,reply_to=None):
+            proof=current_provenance(content)
+            assert (proof is not None)==(platform=='whatsapp_cloud')
+            if proof:
+                assert current_provenance(content+'extra') is None
+                assert proof['message_id']=='wamid.native'
+            assert reply_to==('wamid.native' if platform=='whatsapp_cloud' else '123456789')
+            sent.append(content)
+            return SendResult(success=content!='uncertain',message_id='native-receipt' if content!='uncertain' else None,error='network uncertain' if content=='uncertain' else None)
+    try:
+        with ledger._transaction() as conn:
+            conn.execute('CREATE TABLE sessions(id TEXT,source TEXT,user_id TEXT,chat_id TEXT,chat_type TEXT,session_key TEXT,origin_json TEXT)')
+            conn.execute('CREATE TABLE messages(id INTEGER,session_id TEXT,role TEXT,content TEXT,timestamp REAL,active INTEGER,platform_message_id TEXT)')
+            conn.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?)',('s','whatsapp_cloud','27840000000','27840000000','dm','native-session',json.dumps({'platform':'whatsapp_cloud','user_id':'27840000000','chat_id':'27840000000'})))
+            conn.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)',(1,'s','user','Please confirm here.',90,1,'wamid.native'))
+        kwargs={'source_row':1} if platform=='whatsapp_cloud' else {'discord_channel':'987654321','reply_to':'123456789'}
+        async def scenario():
+            assert (await follow_up(Native(),'requested answer',**kwargs))['state']=='validated'
+            assert not sent
+            if platform=='whatsapp_cloud':
+                with ledger._transaction() as conn:
+                    conn.execute('UPDATE messages SET active=0')
+                with pytest.raises(ValueError,match='unavailable'):
+                    await follow_up(Native(),'requested answer',send=True,**kwargs)
+                with ledger._transaction() as conn:
+                    conn.execute('UPDATE messages SET active=1')
+            result=await follow_up(Native(),'requested answer',send=True,**kwargs)
+            assert result['state']=='delivered'
+            assert (await follow_up(Native(),'requested answer',send=True,**kwargs))['state']=='already_delivered'
+            assert sent==['requested answer']
+            assert (await follow_up(Native(),'uncertain',send=True,**kwargs))['state']=='unknown'
+            with pytest.raises(ValueError,match='already claimed'):
+                await follow_up(Native(),'uncertain',send=True,**kwargs)
+            assert sent==['requested answer','uncertain']
+        asyncio.run(scenario())
+    finally:
+        reset_hermes_home_override(home)

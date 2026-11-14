@@ -7055,6 +7055,7 @@ async def _standalone_is_forum(aiohttp, chat_id: str, json_headers: dict, sess_k
 async def _standalone_send(
     pconfig, chat_id: str, message: str, *, thread_id: Optional[str] = None,
     media_files: Optional[list] = None, force_document: bool = False, caption: Optional[str] = None,
+    reply_to: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Send via Discord REST without a live gateway adapter (token: ``pconfig.token`` then env var).
     Forum channels (type 15) reject ``POST /messages``, so a thread post is created via
@@ -7143,7 +7144,13 @@ async def _standalone_send(
             url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                payload = {"content": message}
+                if reply_to:
+                    if not str(reply_to).isdigit():
+                        return send_error('Discord reply reference must be a native message ID')
+                    payload['message_reference'] = {'message_id': str(reply_to), 'fail_if_not_exists': True}
+                    payload['allowed_mentions'] = {'parse': [], 'replied_user': False}
+                async with session.post(url, headers=json_headers, json=payload, **_req_kw) as resp:
                     last_data, err = await _standalone_response_json_or_error(resp, "Discord API error")
                     if err:
                         return err

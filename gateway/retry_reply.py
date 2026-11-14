@@ -1,7 +1,9 @@
 """Exact native-inbound recovery for final replies definitively held before provider IO.
 
-Operator route: python -m gateway.retry_reply --obligation ID [--send].
-The default validates without sending. Ambiguous/claimed/delivered rows never retry.
+Operator routes: python -m gateway.retry_reply --obligation ID [--send], or
+--source-row ID --reply-file FILE [--send], or --discord-channel ID --reply-to
+NATIVE_ID --reply-file FILE [--send]. The default validates without sending.
+Ambiguous/claimed/unknown writes never retry. Follow-ups require task-level send authority.
 """
 from __future__ import annotations
 
@@ -13,6 +15,9 @@ import logging
 import time
 
 from gateway import delivery_ledger as ledger
+from contextlib import nullcontext
+from pathlib import Path
+import hashlib
 
 
 def validate_reply(conn, obligation_id, adapter):
@@ -114,9 +119,73 @@ class DiscordRecoveryAdapter:
         from plugins.platforms.discord.adapter import _standalone_send
         # A verified existing channel/thread is already known, so do not create a forum post.
         result=await _standalone_send(self.config,chat_id,content,
-                                      thread_id=str((metadata or {}).get('thread_id') or chat_id))
+                                      thread_id=str((metadata or {}).get('thread_id') or chat_id), reply_to=reply_to)
         return SendResult(success=result.get('success') is True,message_id=result.get('message_id'),
                           error=result.get('error'))
+
+
+async def follow_up(adapter, content, *, source_row=None, discord_channel=None, reply_to=None, send=False):
+    """Explicit operator follow-up, using the existing outbox and native sender.
+
+    WhatsApp requires an actual persisted inbound; Discord's explicit operator
+    mode retains ordinary outbound admission and binds an existing reply target.
+    Neither mode fabricates an inbound event or changes a failed answer.
+    """
+    from gateway.outbound_policy import evaluate
+    if not content.strip():
+        raise ValueError('A reply body is required')
+    inbound = None
+    if source_row is not None:
+        with ledger._transaction() as conn:
+            conn.row_factory = __import__('sqlite3').Row
+            found = conn.execute("""SELECT m.*,s.source,s.user_id,s.chat_id,s.chat_type,s.session_key,s.origin_json
+                FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.id=? AND m.role='user' AND m.active=1""",
+                (source_row,)).fetchone()
+        if not found:
+            raise ValueError('The original native inbound is unavailable')
+        inbound = dict(found)
+        origin = json.loads(inbound['origin_json'] or '{}')
+        actor = str(inbound['user_id'])
+        if (inbound['source'] != 'whatsapp_cloud' or inbound['chat_type'] != 'dm'
+                or actor != str(inbound['chat_id']) or not inbound['platform_message_id'] or not inbound['session_key']
+                or origin.get('platform') != 'whatsapp_cloud'
+                or str(origin.get('user_id')) != actor or str(origin.get('chat_id')) != actor
+                or not adapter._is_dm_allowed(actor)):
+            raise ValueError('The native inbound does not authorize this WhatsApp conversation')
+        row = dict(platform='whatsapp_cloud', chat_id=actor, thread_id=None, content=content,
+                   authenticated_actor=actor)
+        reference = inbound['platform_message_id']
+        session_key = inbound['session_key']
+    else:
+        if not str(discord_channel or '').isdigit() or not str(reply_to or '').isdigit():
+            raise ValueError('Exact Discord channel and original message are required')
+        row = dict(platform='discord', chat_id=str(discord_channel), thread_id=None, content=content)
+        reference, session_key = str(reply_to), 'operator:discord:' + str(discord_channel)
+    scope = lambda: _native_reply_scope(row, inbound) if inbound else nullcontext()
+    with scope():
+        admission = evaluate(row['platform'], row['chat_id'], content, profile_home=adapter._outbound_policy_home)
+    if admission.get('allow') is not True:
+        return admission
+    source = dict(session_key=session_key, platform=row['platform'], channel_id=row['chat_id'], thread_id='',
+                  run_id='operator-follow-up:' + reference, transport_profile='default')
+    identity = hashlib.sha256(content.encode()).hexdigest()
+    previous = ledger.source_delivery_receipt(source, identity)
+    if previous:
+        return dict(success=True, delivered=True, state='already_delivered', message_id=previous['native_message_id'])
+    if not send:
+        return dict(success=True, delivered=False, state='validated')
+    receipt = ledger.source_obligation(source, identity, content, {'reply_to': reference, 'source_row': source_row})
+    oid = receipt['obligation_id']
+    if not ledger.begin_source_send(oid):
+        raise ValueError('This reply is already claimed; reconcile its existing receipt before retrying')
+    with scope():
+        result = await adapter.send(row['chat_id'], content, reply_to=reference)
+    if not result.success or not result.message_id:
+        return dict(success=False, delivered=False, state='unknown', obligation_id=oid, error=result.error)
+    if not ledger.acknowledge_source_send(oid, result.message_id):
+        raise RuntimeError('Provider accepted reply; outbox acknowledgment needs reconciliation')
+    logging.getLogger('gateway.run').info('Delivered source follow-up obligation=%s native_receipt=%s', oid, result.message_id)
+    return dict(success=True, delivered=True, state='delivered', message_id=result.message_id, obligation_id=oid)
 
 
 def main():
@@ -124,7 +193,12 @@ def main():
     logger.setLevel(logging.INFO)
     logger.addHandler(logging.StreamHandler())
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--obligation',required=True)
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument('--obligation')
+    modes.add_argument('--source-row', type=int)
+    modes.add_argument('--discord-channel')
+    parser.add_argument('--reply-to')
+    parser.add_argument('--reply-file', type=Path)
     parser.add_argument('--send',action='store_true',help='Reserve and deliver this verified exact reply once')
     args = parser.parse_args()
     async def run():
@@ -136,20 +210,30 @@ def main():
         from hermes_cli.send_cmd import _load_hermes_env
         set_secret_scope(build_profile_secret_scope(get_hermes_home()),profile_home=str(get_hermes_home()))
         _load_hermes_env()
-        with ledger._transaction() as conn:
-            native = conn.execute('SELECT platform FROM delivery_obligations WHERE obligation_id=?',(args.obligation,)).fetchone()
-        if not native:
-            raise ValueError('Unknown obligation')
-        platform=Platform(native[0])
+        if args.obligation:
+            with ledger._transaction() as conn:
+                native = conn.execute('SELECT platform FROM delivery_obligations WHERE obligation_id=?',(args.obligation,)).fetchone()
+            if not native:
+                raise ValueError('Unknown obligation')
+            platform=Platform(native[0])
+        else:
+            if not args.reply_file:
+                raise ValueError('--reply-file is required for an operator follow-up')
+            platform = Platform.DISCORD if args.discord_channel else Platform.WHATSAPP_CLOUD
+        async def deliver(adapter):
+            if args.obligation:
+                return await retry_reply(args.obligation, adapter, send=args.send)
+            return await follow_up(adapter, args.reply_file.read_text(), source_row=args.source_row,
+                                   discord_channel=args.discord_channel, reply_to=args.reply_to, send=args.send)
         config = load_gateway_config().platforms[platform]
         if platform==Platform.DISCORD:
-            return await retry_reply(args.obligation,DiscordRecoveryAdapter(config),send=args.send)
+            return await deliver(DiscordRecoveryAdapter(config))
         adapter = WhatsAppCloudAdapter(config)
         if not adapter._phone_number_id or not adapter._access_token:
             raise ValueError('Native WhatsApp Cloud credentials unavailable')
         async with httpx.AsyncClient(timeout=30) as client:
             adapter._http_client=client
-            return await retry_reply(args.obligation,adapter,send=args.send)
+            return await deliver(adapter)
     try:
         print(json.dumps(asyncio.run(run())))
     except Exception as exc:

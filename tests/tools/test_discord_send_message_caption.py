@@ -131,3 +131,15 @@ def test_no_caption_non_forum_keeps_separate_text():
         assert calls[1][0].endswith("/messages")
     finally:
         os.unlink(img)
+
+
+def test_operator_reply_uses_native_reference_without_ping():
+    session_ctx,calls=_session_with([_resp(200,{'id':'native-receipt'})])
+    with patch('aiohttp.ClientSession',return_value=session_ctx):
+        result=asyncio.run(_standalone_send(_pconfig(),'999000333','Requested follow-up',
+                                          thread_id='999000333',reply_to='123456789'))
+    assert result['success'] is True
+    assert calls==[('https://discord.com/api/v10/channels/999000333/messages',{
+        'content':'Requested follow-up',
+        'message_reference':{'message_id':'123456789','fail_if_not_exists':True},
+        'allowed_mentions':{'parse':[],'replied_user':False}},None)]

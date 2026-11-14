@@ -139,7 +139,8 @@ async def follow_up(adapter, content, *, source_row=None, discord_channel=None, 
         with ledger._transaction() as conn:
             conn.row_factory = __import__('sqlite3').Row
             found = conn.execute("""SELECT m.*,s.source,s.user_id,s.chat_id,s.chat_type,s.session_key,s.origin_json
-                FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.id=? AND m.role='user' AND m.active=1""",
+                FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.id=? AND m.role='user'
+                AND (m.active=1 OR m.compacted=1)""",
                 (source_row,)).fetchone()
         if not found:
             raise ValueError('The original native inbound is unavailable')

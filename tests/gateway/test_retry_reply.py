@@ -112,6 +112,7 @@ def test_operator_followup_native_custody_and_uncertain_dedup(tmp_path,monkeypat
             conn.execute('CREATE TABLE messages(id INTEGER,session_id TEXT,role TEXT,content TEXT,timestamp REAL,active INTEGER,platform_message_id TEXT)')
             conn.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?)',('s','whatsapp_cloud','27840000000','27840000000','dm','native-session',json.dumps({'platform':'whatsapp_cloud','user_id':'27840000000','chat_id':'27840000000'})))
             conn.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)',(1,'s','user','Please confirm here.',90,1,'wamid.native'))
+            conn.execute('ALTER TABLE messages ADD COLUMN compacted INTEGER DEFAULT 0')
         kwargs={'source_row':1} if platform=='whatsapp_cloud' else {'discord_channel':'987654321','reply_to':'123456789'}
         async def scenario():
             assert (await follow_up(Native(),'requested answer',**kwargs))['state']=='validated'
@@ -122,7 +123,8 @@ def test_operator_followup_native_custody_and_uncertain_dedup(tmp_path,monkeypat
                 with pytest.raises(ValueError,match='unavailable'):
                     await follow_up(Native(),'requested answer',send=True,**kwargs)
                 with ledger._transaction() as conn:
-                    conn.execute('UPDATE messages SET active=1')
+                    conn.execute('UPDATE messages SET compacted=1')
+                assert (await follow_up(Native(),'requested answer',**kwargs))['state']=='validated'
             result=await follow_up(Native(),'requested answer',send=True,**kwargs)
             assert result['state']=='delivered'
             assert (await follow_up(Native(),'requested answer',send=True,**kwargs))['state']=='already_delivered'

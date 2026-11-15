@@ -244,8 +244,10 @@ def record_reaction(platform: str, chat_id: Any, message_id: Any, user_id: Optio
             current = db.execute("SELECT vote FROM votes WHERE key=?", (key,)).fetchone()
             current_vote = current["vote"] if current else None
             if removed:
-                # Discord stacks reactions: removing the one that is not the current vote changes nothing.
-                if normalize_vote(emoji) != current_vote:
+                # WhatsApp holds one reaction per person and reports a removal with no emoji: that
+                # clears the vote. Discord stacks reactions and names the emoji: removing one that is
+                # not the current vote changes nothing.
+                if emoji and normalize_vote(emoji) != current_vote:
                     return None
                 new = None
             vote = new or "none"

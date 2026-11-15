@@ -1098,6 +1098,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         the message is one we sent. A reaction with no emoji is the removal of the previous one.
         """
         reaction = raw_message.get("reaction") or {}
+        logger.info("[whatsapp_cloud] reaction envelope received (wamid=%s, removed=%s)",
+                    reaction.get("message_id"), not reaction.get("emoji"))
         if (raw_message.get("chat") or str(metadata.get("phone_number_id") or "") != self._phone_number_id
                 or not sender_id or not self._is_dm_allowed(sender_id)):
             return

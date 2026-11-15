@@ -1693,6 +1693,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             from gateway import feedback
             emoji = str(payload.emoji)
             bot = getattr(self._client, "user", None)
+            if not getattr(self, "_reaction_events_logged", False):
+                self._reaction_events_logged = True  # one line proves reaction events reach this adapter
+                logger.info("[%s] reaction events are arriving (first: %s, by_self=%s)", self.name, emoji,
+                            bool(bot and payload.user_id == bot.id))
             if feedback.normalize_vote(emoji) is None or (bot and payload.user_id == bot.id):
                 return
             author_id = getattr(payload, "message_author_id", None)

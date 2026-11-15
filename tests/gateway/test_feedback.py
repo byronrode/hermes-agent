@@ -76,9 +76,11 @@ def test_skin_tone_thumbs_count_and_changing_or_removing_updates(feedback_home):
     assert feedback.record_reaction("wa", "chat-1", "m1", OWNER, UP + "\U0001F3FD")["vote"] == "up"
     assert feedback.record_reaction("wa", "chat-1", "m1", OWNER, UP) is None  # no change, no new record
     assert feedback.record_reaction("wa", "chat-1", "m1", OWNER, DOWN)["vote"] == "down"
-    assert feedback.record_reaction("wa", "chat-1", "m1", OWNER, None, removed=True) is None  # no emoji known
-    assert feedback.record_reaction("wa", "chat-1", "m1", OWNER, DOWN, removed=True)["vote"] == "none"
-    assert [r["vote"] for r in spooled(feedback_home)] == ["up", "down", "none"]
+    assert feedback.record_reaction("wa", "chat-1", "m1", OWNER, None, removed=True)["vote"] == "none"  # WhatsApp: no emoji
+    assert feedback.record_reaction("wa", "chat-1", "m1", OWNER, None, removed=True) is None  # already clear
+    assert feedback.record_reaction("wa", "chat-1", "m1", OWNER, DOWN)["vote"] == "down"
+    assert feedback.record_reaction("wa", "chat-1", "m1", OWNER, "\u2764\ufe0f")["vote"] == "none"  # replaced by another emoji
+    assert [r["vote"] for r in spooled(feedback_home)] == ["up", "down", "none", "down", "none"]
 
 
 def test_discord_removing_a_reaction_that_is_not_the_current_vote_changes_nothing(feedback_home):

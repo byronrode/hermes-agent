@@ -463,7 +463,9 @@ def lessons_prompt(realm: Optional[str]) -> str:
         return ""
     lessons = list_lessons(realm, PROMPT_LESSON_CAP)
     if not lessons:
-        return ""
+        return (f"## Corrections from Byron (realm: {realm})\nNone saved yet. He saves one by marking a reply of "
+                f"yours 👎 and replying to it; the gateway stores it. If he asks what he has corrected you on, "
+                f"run `{_cli(realm, 'lessons')}` to check.")
     total = len(_read(realm)[1])
     lines = [f"## Corrections from Byron (realm: {realm}) — follow them",
              "Byron saved these by marking a reply of yours 👎 and answering it. They are his own words. "

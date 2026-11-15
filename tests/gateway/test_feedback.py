@@ -182,6 +182,12 @@ def test_lessons_load_next_turn_newest_first_and_are_capped(feedback_home):
     assert [l["words"] for l in feedback.search_lessons("personal", "correction 4")][0] == "correction 4"
 
 
+def test_an_empty_realm_still_tells_mara_how_to_check(feedback_home):
+    prompt = feedback.turn_prompt("be brief", "wa", "dm", None, "chat-1", None)
+    assert "None saved yet" in prompt and "gateway.feedback lessons --realm personal" in prompt
+    assert feedback.turn_prompt("be brief", "wa", "dm", None, "chat-1", None) == prompt  # stable: prompt-cache friendly
+
+
 def test_turn_prompt_adds_the_block_to_the_channel_prompt(feedback_home):
     make_lessons("wa", "chat-1", 1)
     prompt = feedback.turn_prompt("be brief", "wa", "dm", None, "chat-1", None)

@@ -95,6 +95,12 @@ def is_owner(platform: str, user_id: Optional[str]) -> bool:
 
 
 def enabled(platform: str) -> bool:
+    """On only for the gateway launched from the default Hermes home (Mara's); a separate product
+    gateway such as Dobby's runs from its own home and never takes part."""
+    if not os.environ.get("HERMES_FEEDBACK_HOME"):
+        from hermes_constants import get_process_hermes_home
+        if Path(get_process_hermes_home()).resolve() != _root().resolve():
+            return False
     return bool((load_config().get("owners") or {}).get(str(platform)))
 
 

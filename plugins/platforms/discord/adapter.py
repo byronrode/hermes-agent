@@ -1348,6 +1348,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 await adapter_self._dispatch_discord_message(message)
 
             @self._client.event
+            async def on_raw_reaction_add(payload):
+                await adapter_self._on_feedback_reaction(payload, removed=False)
+
+            @self._client.event
+            async def on_raw_reaction_remove(payload):
+                await adapter_self._on_feedback_reaction(payload, removed=True)
+
+            @self._client.event
             async def on_message_edit(before: DiscordMessage, after: DiscordMessage):
                 await adapter_self._on_platform_message_edit(before, after)
 
@@ -1674,6 +1682,42 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             }
         message = after if after is not None else before
         await self._emit_platform_event("message_edited", lambda: self._message_event_parts(message, _extra))
+
+    async def _on_feedback_reaction(self, payload, removed: bool) -> None:
+        """A 👍/👎 on a message of ours is a vote for the feedback loop; it is recorded silently.
+
+        ``feedback`` ignores everyone but the configured owner and any other emoji, and (when
+        Discord names the author) anything that is not our own message. Never raises.
+        """
+        try:
+            from gateway import feedback
+            emoji = str(payload.emoji)
+            bot = getattr(self._client, "user", None)
+            if feedback.normalize_vote(emoji) is None or (bot and payload.user_id == bot.id):
+                return
+            author_id = getattr(payload, "message_author_id", None)
+            authored = (author_id == bot.id) if (author_id is not None and bot) else None
+            guild_id = getattr(payload, "guild_id", None)
+            recorded = await asyncio.to_thread(
+                feedback.record_reaction, "discord", str(payload.channel_id), str(payload.message_id),
+                str(payload.user_id), emoji, removed, mara_authored=authored,
+                chat_type="group" if guild_id else "dm", scope_id=str(guild_id) if guild_id else None)
+            logger.info("[%s] reaction received (message=%s, vote=%s)", self.name, payload.message_id,
+                        (recorded or {}).get("vote", "ignored"))
+        except Exception:
+            logger.debug("[%s] feedback reaction failed", self.name, exc_info=True)
+
+    async def _note_sent_for_feedback(self, channel, message_ids, chunks) -> None:
+        """Index what we sent so a later 👍/👎 or reply can be matched to the exact message."""
+        try:
+            from gateway import feedback
+            guild = getattr(channel, "guild", None)
+            for message_id, chunk in zip(message_ids, chunks):
+                await asyncio.to_thread(
+                    feedback.note_outbound, "discord", str(getattr(channel, "id", "")), message_id, chunk,
+                    chat_type="group" if guild else "dm", scope_id=str(guild.id) if guild else None)
+        except Exception:
+            logger.debug("[%s] feedback sent-index failed", self.name, exc_info=True)
 
     async def _on_platform_message_delete(self, message) -> None:
         """Normalize ``on_message_delete`` into ``message_deleted``. Discord omits the
@@ -3103,6 +3147,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     else:
                         raise
                 message_ids.append(str(msg.id))
+            await self._note_sent_for_feedback(channel, message_ids, chunks)
             # Track the last sent message for history backfill (skips the full history scan).
             if message_ids:
                 _target_id = thread_id or chat_id

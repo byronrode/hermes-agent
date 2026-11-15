@@ -4279,6 +4279,9 @@ class BasePlatformAdapter(ABC):
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
         delivery_adapter = self._final_delivery_adapter(event.source)
+        if getattr(event, "_feedback_noted", False):  # a 👎 correction was just saved: say so, briefly
+            from gateway import feedback
+            text_content = f"{text_content.rstrip()}\n\n{feedback.NOTED_LINE}"
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
@@ -4289,7 +4292,33 @@ class BasePlatformAdapter(ABC):
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+        await self._note_final_for_feedback(event, session_key, text_content, result, metadata)
         return result, delivery_adapter
+
+    async def _note_final_for_feedback(self, event: MessageEvent, session_key: str, text_content: str,
+                                       result: "SendResult", metadata: Dict[str, Any]) -> None:
+        """Record which request and turn produced this reply so a later 👍/👎 resolves to them.
+        Best effort: never affects delivery."""
+        turn = getattr(event, "_feedback_turn", None)
+        if not (turn and result.success):
+            return
+        try:
+            from gateway import feedback
+            source = event.source
+            platform = self._reply_platform(event)
+            ids = [result.message_id, *result.continuation_message_ids]
+            raw = result.raw_response
+            if isinstance(raw, dict):
+                ids.extend(raw.get("message_ids") or [])
+            await asyncio.to_thread(
+                feedback.note_turn, platform, getattr(source, "thread_id", None) or source.chat_id,
+                list(dict.fromkeys(str(i) for i in ids if i)), text_content,
+                request_id=event.message_id, request_text=event.text, session_key=session_key,
+                session_id=turn.get("session_id"), turn_id=turn.get("turn_id"),
+                role=source.profile or "mara", skill=turn.get("skill"), chat_type=source.chat_type,
+                scope_id=source.scope_id, profile=source.profile)
+        except Exception:
+            logger.debug("[%s] feedback turn note failed", self.name, exc_info=True)
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:
         """Clear the crash-recovery marker the runner handed to this delivery lifecycle

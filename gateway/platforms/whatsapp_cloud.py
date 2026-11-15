@@ -47,7 +47,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin, _get_wsecret
 from gateway.platforms.access_policy_mixin import OPTIN_TRUTHY as _OPTIN_TRUTHY
 from gateway.platforms.media_cache import ext_for_mime
-from gateway import rich_sent_store, whatsapp_chat_window
+from gateway import feedback, rich_sent_store, whatsapp_chat_window
 from hermes_constants import get_hermes_dir, get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -428,6 +428,9 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         return await self.send_template(chat_id, content, scheduled_template, metadata=metadata)
                     return SendResult(success=False, error=err)
                 last_message_id = ids[0].get("id") if ids else last_message_id
+                if ids and ids[0].get("id"):
+                    await asyncio.to_thread(feedback.note_outbound, "whatsapp_cloud", chat_id,
+                                            ids[0]["id"], chunk, chat_type="dm")
                 if (idx == 0 and last_message_id and (metadata or {}).get("job_id") and scheduled_template
                         and len(" ".join(content.split())) <= 1024 and len(formatted) <= self._outgoing_chunk_limit()):
                     await asyncio.to_thread(whatsapp_chat_window.remember_send, self._window_home,
@@ -476,6 +479,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         message_id = ids[0].get("id") if ids else None
         if message_id:
             await rich_sent_store.record_async(chat_id, message_id, content)
+            await asyncio.to_thread(feedback.note_outbound, "whatsapp_cloud", chat_id, message_id, content,
+                                    chat_type="dm")
         return SendResult(success=True, message_id=message_id)
 
     async def _retry_window_rejection(self, chat_id: str, message_id: str) -> None:
@@ -1086,6 +1091,22 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 logger.exception("[whatsapp_cloud] failed to read document text: %s", doc)
         return body, inlined
 
+    async def _record_vote(self, raw_message: Dict[str, Any], sender_id: str, metadata: Dict[str, Any]) -> None:
+        """A 👍/👎 tap on a message of ours: record it for the feedback loop and say nothing.
+
+        Only a direct chat on our own number counts; ``feedback`` checks the sender is the owner and
+        the message is one we sent. A reaction with no emoji is the removal of the previous one.
+        """
+        reaction = raw_message.get("reaction") or {}
+        if (raw_message.get("chat") or str(metadata.get("phone_number_id") or "") != self._phone_number_id
+                or not sender_id or not self._is_dm_allowed(sender_id)):
+            return
+        recorded = await asyncio.to_thread(
+            feedback.record_reaction, "whatsapp_cloud", sender_id, reaction.get("message_id"), sender_id,
+            reaction.get("emoji"), not reaction.get("emoji"), chat_type="dm")
+        logger.info("[whatsapp_cloud] reaction received (wamid=%s, vote=%s)", reaction.get("message_id"),
+                    (recorded or {}).get("vote", "ignored"))
+
     async def _build_message_event_from_cloud(
         self, raw_message: Dict[str, Any], contacts_by_waid: Dict[str, str], metadata: Dict[str, Any],
     ) -> Optional[MessageEvent]:
@@ -1100,6 +1121,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Record before button resolution or attachment download: either is a real user message.
             await asyncio.to_thread(whatsapp_chat_window.record_inbound,
                                     self._window_home, self._phone_number_id, sender_id, raw_message.get("timestamp"))
+        if msg_type_str == "reaction":
+            await self._record_vote(raw_message, sender_id, metadata)
         if msg_type_str in _CONTENTLESS_KINDS:
             logger.debug("[whatsapp_cloud] skipping contentless %s envelope (wamid=%s)", msg_type_str, raw_message.get("id"))
             return None

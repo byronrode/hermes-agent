@@ -2182,6 +2182,9 @@ class GatewayTurnMixin:
         if not isinstance(prepared, self._PreparedTurn):
             return prepared
         history, message_text = prepared.history, prepared.message_text
+        from gateway import feedback
+        turn_channel_prompt = feedback.begin_turn(
+            event, source, session_entry.session_id, prepared.persistence_owner)
 
         try:
             hook_ctx = {
@@ -2210,7 +2213,7 @@ class GatewayTurnMixin:
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
-                channel_prompt=event.channel_prompt, moa_config=getattr(event, "_moa_config", None),
+                channel_prompt=turn_channel_prompt, moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
@@ -3885,7 +3888,8 @@ class GatewayTurnMixin:
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
-            next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+            from gateway import feedback
+            next_channel_prompt = feedback.begin_turn(pending_event, next_source, session_id, None)
             next_message_type = getattr(pending_event, "message_type", None)
 
         # Clear the prior turn's streaming-TTS completion marker so the recursive turn isn't suppressed.

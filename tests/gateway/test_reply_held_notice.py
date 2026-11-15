@@ -66,6 +66,21 @@ async def test_refused_reply_is_followed_by_a_plain_notice_in_the_same_chat(tmp_
 
 
 @pytest.mark.asyncio
+async def test_timeout_is_not_reported_as_unsent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _Adapter(refuse_first=False)
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        from gateway.platforms.base import SendResult
+        adapter.sent.append(content)
+        return SendResult(success=False, error="request timed out")
+    adapter.send = send
+    adapter.set_message_handler(_handler("Your list is ready."))
+    event = _event()
+    await adapter._process_message_background(event, build_session_key(event.source))
+    assert _Adapter._REPLY_NOT_SENT_NOTICE not in adapter.sent
+
+
+@pytest.mark.asyncio
 async def test_delivered_reply_sends_no_notice(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _Adapter(refuse_first=False)

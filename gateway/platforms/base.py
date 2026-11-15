@@ -4325,11 +4325,11 @@ class BasePlatformAdapter(ABC):
         except Exception:
             logger.debug("[%s] reply custody derivation failed", self.name, exc_info=True)
 
-    _REPLY_NOT_SENT_NOTICE = ("I made your reply, but part of it did not send because of a fault on my side. "
-                              "Message me again and I will resend it.")
+    _REPLY_NOT_SENT_NOTICE = "Part of my reply did not send. Message me again and I will resend it another way."
 
     async def _notify_reply_not_sent(self, event: MessageEvent, response: str, metadata: Any) -> None:
-        """A reply the outbound policy refused must not end in silence: say so in the same chat."""
+        """A reply part that was definitively refused (policy hold, provider rejection) must not end
+        in silence: say so in the same chat."""
         try:
             from gateway.outbound_policy import derive_reply_grants
             if not derive_reply_grants(self._reply_platform(event), event.source.chat_id, response,
@@ -4489,15 +4489,17 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
-        held_by_policy = False  # a final reply part refused locally by the outbound policy
+        reply_part_failed = False  # a final reply part (text or attachment) was definitively refused
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded, held_by_policy
+            nonlocal delivery_attempted, delivery_succeeded, reply_part_failed
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
-                if not getattr(result, "success", False) and "outbound held" in str(getattr(result, "error", "") or ""):
-                    held_by_policy = True
+                _error = str(getattr(result, "error", "") or "")
+                # A timeout may still have delivered, so it never earns a "did not send" notice.
+                if not getattr(result, "success", False) and not self._is_timeout_error(_error):
+                    reply_part_failed = True
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
@@ -4566,7 +4568,7 @@ class BasePlatformAdapter(ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
-                if held_by_policy:
+                if reply_part_failed:
                     await self._notify_reply_not_sent(event, response, _final_thread_metadata)
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)

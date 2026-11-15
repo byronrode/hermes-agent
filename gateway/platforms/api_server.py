@@ -1253,12 +1253,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._browser_control_artifact_locks: Dict[str, asyncio.Lock] = {}
 
     def active_agent_work_count(self) -> int:
-        """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
-        (task-based, since ``_active_run_agents`` has a queued-before-agent gap)."""
+        """Pending admissions, turns, /v1/runs and retained source-result transactions.
+
+        Task-based: ``_active_run_agents`` has a queued-before-agent gap.
+        """
         try:
+            from gateway.platforms.api_server_source_receipts import source_result_work_count
             return (int(getattr(self, "_pending_agent_requests", 0))
                     + int(self._inflight_agent_runs)
-                    + sum(not task.done() for task in self._active_run_tasks.values()))
+                    + sum(not task.done() for task in self._active_run_tasks.values())
+                    + source_result_work_count(self))
         except Exception:
             return 0
 
@@ -1778,6 +1782,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     def _close_cached_session_dbs(self) -> None:
         """Close SessionDB handles owned by this adapter's profile cache."""
+        from gateway.platforms.api_server_source_receipts import defer_source_result_close
+        if defer_source_result_close(self, self._close_cached_session_dbs):
+            return
         with self._session_db_cache_lock:
             self._session_db_cache_closed = True
             cached = list(self._session_dbs.values())
@@ -4423,6 +4430,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         failed reconnects and turns the whole gateway into a zombie (OSError: [Errno 24] Too many open
         files, #37011).
         """
+        self._source_results_closing = True
         self._mark_disconnected()
         # getattr: disconnect() tolerates bare __new__ fixtures (pinned in test_api_server_run_idempotency).
         routed = getattr(self, "_response_stores", {})

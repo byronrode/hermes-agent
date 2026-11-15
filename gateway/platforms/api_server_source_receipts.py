@@ -16,6 +16,31 @@ from aiohttp import web
 
 
 _FAILURES = (ValueError, KeyError, TypeError, OSError, RuntimeError, TimeoutError, sqlite3.Error, OverflowError)
+# The final gateway close gate runs after its adapter registry is detached.
+_RESULT_TASKS = set()
+
+
+def source_result_work_count(owner=None):
+    tasks = (_RESULT_TASKS if owner is None else
+             (entry['task'] for entry in getattr(owner, '_source_result_transactions', {}).values()))
+    return sum(not task.done() for task in tasks)
+
+
+def defer_source_result_close(owner, close):
+    """Keep native stores alive until their retained transactions really settle."""
+    tasks = [entry['task'] for entry in getattr(owner, '_source_result_transactions', {}).values()
+             if not entry['task'].done()]
+    if not tasks:
+        return False
+    closed = False
+    def settled(_):
+        nonlocal closed
+        if not closed and all(task.done() for task in tasks) and not any(task.cancelled() for task in tasks):
+            closed = True
+            close()
+    for task in tasks:
+        task.add_done_callback(settled)
+    return True
 
 
 def source_provider(owner):
@@ -65,6 +90,7 @@ _DIAGNOSTIC_REASONS = frozenset({
     'source_changed','source_changed_before_delivery','no_result_or_destination_arguments',
     'source_binding_mismatch','malformed_source_result','source_result_identity_changed',
     'persisted_source_result_changed','stale_first_source_result','delivery_readback_failed',
+    'source_result_in_flight',
 })
 
 
@@ -240,10 +266,50 @@ async def handle_result(owner, request):
         # immutable proof even for a previously validated/persisted result.
         phase = 'producer_budget'
         timeout = source_read_budget(provider)
-        phase = 'producer_read'
-        result = await asyncio.wait_for(provider.read_result(source), timeout=timeout)
-        phase = 'producer_validation'
+        if getattr(owner, '_source_results_closing', False):
+            raise RuntimeError('source_result_owner_closing')
+        transactions = getattr(owner, '_source_result_transactions', None)
+        if transactions is None:
+            transactions = owner._source_result_transactions = {}
+        key = (scope, run_id)
+        entry = transactions.get(key)
+        if entry is not None and (entry['source'] != source or entry['provider'] is not provider):
+            if entry['task'].done():
+                transactions.pop(key)
+            raise ValueError('source_changed')
+        if entry is None:
+            task = asyncio.create_task(_produce_result(owner, request, scope, run_id, source, provider))
+            entry = transactions[key] = {'task':task, 'source':source, 'provider':provider}
+            _RESULT_TASKS.add(task)
+            task.add_done_callback(_RESULT_TASKS.discard)
+        # An HTTP timeout/disconnect cannot cancel a thread-backed producer and
+        # discard its commit tail. Retries join this same transaction, not a
+        # detached late-result cache or another provider invocation.
+        phase = 'result_wait'
+        try:
+            payload, status = await asyncio.wait_for(asyncio.shield(entry['task']), timeout=timeout)
+        except TimeoutError:
+            return web.json_response({'state':'unavailable','diagnostic':{
+                'phase':phase,'reason':'source_result_in_flight','error_type':'TimeoutError'}}, status=503)
+        if transactions.get(key) is entry:
+            transactions.pop(key)
+        if _authorized(owner, request) is not None:
+            raise ValueError('source_changed')
         if source_provider(owner) is not provider or source != revalidate_source(owner, request, scope, run_id, snapshot=source):
+            raise ValueError('source_changed')
+        return web.json_response(payload, status=status)
+    except _FAILURES as error:
+        return web.json_response({'state':'unavailable',
+                                  'diagnostic':source_diagnostic(error,phase)}, status=503)
+
+
+async def _produce_result(owner, request, scope, run_id, source, provider):
+    phase = 'producer_read'
+    try:
+        result = await provider.read_result(source)
+        phase = 'producer_validation'
+        if (_authorized(owner, request) is not None or source_provider(owner) is not provider
+                or source != revalidate_source(owner, request, scope, run_id, snapshot=source)):
             raise ValueError('source_changed')
         multiple=getattr(provider,'source_result_protocol',None)=='per_intent_v1' and source.get('intent')=='mara_request'
         more=False
@@ -252,7 +318,7 @@ async def handle_result(owner, request):
             result={k:v for k,v in result.items() if k!='more_results'}
         delivery = _delivery(result, source)
         if delivery is None:
-            return web.json_response({'state': result.get('state') if result.get('state') in {'queued','unavailable'} else 'unavailable'})
+            return {'state': result.get('state') if result.get('state') in {'queued','unavailable'} else 'unavailable'}, 200
         phase = 'delivery_commit'
         db = await owner._ensure_session_db_async()
         session = await asyncio.to_thread(db.resolve_resume_session_id, source['session_id']) or source['session_id']
@@ -275,14 +341,23 @@ async def handle_result(owner, request):
                 raise ValueError('stale_first_source_result')
         # Persist first validation before the transcript lease can defer writing.
         owner._run_idempotency_store.remember_source_result(scope, run_id, source, delivery, **({'allow_multiple':True} if multiple else {}))
-        if source != revalidate_source(owner, request, scope, run_id, snapshot=source):
+        if (_authorized(owner, request) is not None or source_provider(owner) is not provider
+                or source != revalidate_source(owner, request, scope, run_id, snapshot=source)):
             raise ValueError('source_changed_before_delivery')
         row = await asyncio.to_thread(db.append_source_result_delivery, session,
             delivery['content'], delivery['metadata'], display_kind=delivery['display_kind'])
         persisted = await asyncio.to_thread(db.get_source_result_delivery, session, delivery['identity'], delivery['display_kind'])
         if persisted is None or persisted['id'] != row or persisted['content'] != delivery['content'] or persisted['metadata'] != delivery['metadata']:
             raise ValueError('delivery_readback_failed')
-        return web.json_response({'state':'persisted','run_id':run_id,'session_id':source['session_id'],'message_id':row,**({'more_results':more} if multiple else {})})
+        if (_authorized(owner, request) is not None or source_provider(owner) is not provider
+                or source != revalidate_source(owner, request, scope, run_id, snapshot=source)):
+            raise ValueError('source_changed_before_delivery')
+        receipt = {'state':'persisted','run_id':run_id,'session_id':source['session_id'],
+                   'message_id':row,**({'more_results':more} if multiple else {})}
+        bind = getattr(provider, 'bind_gateway_receipt', None)
+        if multiple and callable(bind):
+            phase = 'receipt_binding'
+            await bind(source, receipt)
+        return receipt, 200
     except _FAILURES as error:
-        return web.json_response({'state':'unavailable',
-                                  'diagnostic':source_diagnostic(error,phase)}, status=503)
+        return {'state':'unavailable','diagnostic':source_diagnostic(error,phase)}, 503

@@ -429,3 +429,29 @@ map reader while any v2 reservations need replay rather than blindly downgrading
 that reader, deleting state or reexecuting work. Tests use real native reservations,
 HTTP and SQLite with synthetic company/model transports; they are not live
 business/channel acceptance and do not grant customer actions.
+
+### API source-result transaction lifetime
+
+The API adapter retains one source-result transaction per authenticated run. The
+configured producer budget (at most 30 seconds) bounds the HTTP wait, not the
+lifetime of a thread-backed read. A timeout returns a sanitized
+`result_wait/source_result_in_flight` diagnostic; cancellation or concurrent
+retries cannot start overlapping reads for that run. The original transaction
+continues through current source/provider validation, immutable reservation,
+OS append/readback and, for opted-in per-intent ordinary requests, the provider's
+existing optional `bind_gateway_receipt` callback. Legacy role-status responses
+do not invoke that work-binding callback. It receives the exact persisted row receipt; it grants no
+authority and cannot replace source validation or artifact delivery proof.
+
+A retry joins the retained transaction. Once its response has been consumed,
+the next call can select the next independent intent through the existing
+per-intent protocol. Native result identity/content comparisons, first-validation
+age checks, settled-source recovery and replay behavior remain unchanged. A
+completed transaction does not authorize new work or replay a model turn.
+
+Retained transactions count as active API work, including the gateway's final
+database-close gate after adapters are detached. Disconnect rejects new result
+transactions and defers closing the reservation/SessionDB resources until current
+transactions settle. It never cancels a producer and closes its database under
+the surviving worker. Tests use real HTTP/SQLite with controlled thread-backed
+providers and synthetic binding receipts; they do not establish live delivery.

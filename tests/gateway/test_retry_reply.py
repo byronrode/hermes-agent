@@ -136,3 +136,45 @@ def test_operator_followup_native_custody_and_uncertain_dedup(tmp_path,monkeypat
         asyncio.run(scenario())
     finally:
         reset_hermes_home_override(home)
+
+
+def test_operator_followup_sends_its_image_under_the_same_native_custody(tmp_path,monkeypatch):
+    from gateway import delivery_ledger as ledger
+    from gateway.outbound_policy import current_provenance
+    from gateway.platforms.base import SendResult
+    from gateway.retry_reply import follow_up
+    from hermes_constants import set_hermes_home_override,reset_hermes_home_override
+    monkeypatch.setattr(ledger,'_db_path',lambda:tmp_path/'state.db')
+    image=tmp_path/'picture.jpg'; image.write_bytes(b'x')
+    home=set_hermes_home_override(tmp_path)
+    sent=[]
+    class Native:
+        _outbound_policy_home=tmp_path
+        def _is_dm_allowed(self,actor): return actor=='27840000000'
+        async def send(self,chat,content,reply_to=None):
+            assert current_provenance(content)['message_id']=='wamid.native'
+            sent.append(('text',content)); return SendResult(success=True,message_id='text-receipt')
+        async def send_image_file(self,chat,path,caption=None,reply_to=None,**kw):
+            assert current_provenance('')['message_id']=='wamid.native'
+            assert current_provenance('other') is None
+            sent.append(('image',path)); return SendResult(success=True,message_id='image-receipt')
+    callback=tmp_path/'p.py'; callback.write_text("def decide(event, settings=None):\n return {'allow': True}\n")
+    (tmp_path/'config.yaml').write_text(json.dumps({'outbound_policy':{'required':True,'callback_file':str(callback)}}))
+    try:
+        with ledger._transaction() as conn:
+            conn.execute('CREATE TABLE sessions(id TEXT,source TEXT,user_id TEXT,chat_id TEXT,chat_type TEXT,session_key TEXT,origin_json TEXT)')
+            conn.execute('CREATE TABLE messages(id INTEGER,session_id TEXT,role TEXT,content TEXT,timestamp REAL,active INTEGER,platform_message_id TEXT)')
+            conn.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?,?)',('s','whatsapp_cloud','27840000000','27840000000','dm','native-session',json.dumps({'platform':'whatsapp_cloud','user_id':'27840000000','chat_id':'27840000000'})))
+            conn.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)',(1,'s','user','When do I get it?',90,1,'wamid.native'))
+            conn.execute('ALTER TABLE messages ADD COLUMN compacted INTEGER DEFAULT 0')
+        async def scenario():
+            with pytest.raises(ValueError,match='does not exist'):
+                await follow_up(Native(),'Here it is.',source_row=1,media_file=tmp_path/'missing.jpg')
+            with pytest.raises(ValueError,match='WhatsApp reply only'):
+                await follow_up(Native(),'Here it is.',discord_channel='1',reply_to='2',media_file=image)
+            result=await follow_up(Native(),'Here it is.',source_row=1,media_file=image,send=True)
+            assert result['state']=='delivered'
+            assert sent==[('text','Here it is.'),('image',str(image))]
+        asyncio.run(scenario())
+    finally:
+        reset_hermes_home_override(home)

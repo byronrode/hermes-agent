@@ -197,3 +197,53 @@ def test_whatsapp_reply_survives_native_handler_and_formatter_handoff(tmp_path, 
         asyncio.run(scenario())
     finally:
         reset_hermes_home_override(token)
+
+
+def test_authenticated_reply_with_attachment_keeps_custody_for_text_and_file(tmp_path, monkeypatch):
+    """A MEDIA: reply is split by the adapter into stripped text plus a caption-less file.
+
+    Regression for the 15 Nov hold: both parts reached the policy as strings custody
+    was never retained for, so the user's own answer was held and nothing arrived.
+    """
+    import gateway.outbound_policy as outbound
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    callback = tmp_path / 'policy.py'
+    callback.write_text(
+        "def decide(event, settings=None):\n"
+        " proof = event.get('provenance') or {}\n"
+        " ok = (proof.get('kind') == 'authenticated_reply' and proof.get('recipient') == event['recipient']\n"
+        "       and (event['content'] or event.get('operation') == 'emit'))\n"
+        " return {'allow': bool(ok), 'reason': 'custody'}\n")
+    (tmp_path / 'config.yaml').write_text(json.dumps({'outbound_policy': {
+        'required': True, 'callback_file': str(callback)}}))
+    source = SimpleNamespace(platform=SimpleNamespace(value='whatsapp_cloud'), user_id='person',
+                             chat_id='person', is_bot=False)
+    event = SimpleNamespace(internal=False, message_id='native-message', text='When do I get it?',
+                            raw_message={'id': 'native-message', 'from': 'person'})
+    runner = SimpleNamespace(_is_session_run_current=lambda *args: True,
+                             _is_user_authorized_for_source=lambda *args, **kwargs: True)
+    response = 'Here it is.\n\nMEDIA:/tmp/picture.jpg'
+    stripped = 'Here it is.'
+    with outbound.authorized_reply_scope(runner, event, source, 'session', 1):
+        outbound.retain_final_reply(response)
+    # Before derivation the adapter's actual outputs are refused: the incident.
+    assert evaluate('whatsapp_cloud', 'person', stripped, profile_home=tmp_path)['allow'] is not True
+    assert evaluate('whatsapp_cloud', 'person', '', profile_home=tmp_path, operation='emit')['allow'] is not True
+    assert outbound.derive_reply_grants('whatsapp_cloud', 'person', response, [stripped],
+                                        attachments=2, profile_home=tmp_path) == 2
+    assert evaluate('whatsapp_cloud', 'person', stripped, profile_home=tmp_path)['allow'] is True
+    # Exactly the stripped text, once; anything else is still held.
+    assert evaluate('whatsapp_cloud', 'person', stripped, profile_home=tmp_path, operation='emit')['allow'] is True
+    assert evaluate('whatsapp_cloud', 'person', stripped, profile_home=tmp_path, operation='emit')['allow'] is not True
+    assert evaluate('whatsapp_cloud', 'person', 'Something else', profile_home=tmp_path)['allow'] is not True
+    # One caption-less emission per attachment, no more.
+    for _ in range(2):
+        assert evaluate('whatsapp_cloud', 'person', '', profile_home=tmp_path, operation='emit')['allow'] is True
+    assert evaluate('whatsapp_cloud', 'person', '', profile_home=tmp_path, operation='emit')['allow'] is not True
+
+
+def test_reply_without_retained_custody_derives_nothing(tmp_path, monkeypatch):
+    import gateway.outbound_policy as outbound
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    assert outbound.derive_reply_grants('whatsapp_cloud', 'person', 'never retained', ['text'],
+                                        attachments=1, profile_home=tmp_path) == 0

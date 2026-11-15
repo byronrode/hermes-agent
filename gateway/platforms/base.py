@@ -4309,6 +4309,41 @@ class BasePlatformAdapter(ABC):
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 
+    @staticmethod
+    def _reply_platform(event: MessageEvent) -> str:
+        platform = event.source.platform
+        return getattr(platform, "value", str(platform))
+
+    def _derive_reply_custody(self, event: MessageEvent, response: str, extracted: "_ExtractedResponse") -> None:
+        """Extend the authenticated reply's custody to the body text and attachments the adapter
+        derives from it; a MEDIA: reply otherwise reached the outbound policy as a different string."""
+        try:
+            from gateway.outbound_policy import derive_reply_grants
+            derive_reply_grants(
+                self._reply_platform(event), event.source.chat_id, response, [extracted.text_content],
+                attachments=len(extracted.images) + len(extracted.media_files) + len(extracted.local_files))
+        except Exception:
+            logger.debug("[%s] reply custody derivation failed", self.name, exc_info=True)
+
+    _REPLY_NOT_SENT_NOTICE = ("I made your reply, but part of it did not send because of a fault on my side. "
+                              "Message me again and I will resend it.")
+
+    async def _notify_reply_not_sent(self, event: MessageEvent, response: str, metadata: Any) -> None:
+        """A reply the outbound policy refused must not end in silence: say so in the same chat."""
+        try:
+            from gateway.outbound_policy import derive_reply_grants
+            if not derive_reply_grants(self._reply_platform(event), event.source.chat_id, response,
+                                       [self._REPLY_NOT_SENT_NOTICE]):
+                logger.error("[%s] reply held by outbound policy and no authenticated custody to say so in %s",
+                             self.name, event.source.chat_id)
+                return
+            result = await self.send(chat_id=event.source.chat_id, content=self._REPLY_NOT_SENT_NOTICE,
+                                     reply_to=_reply_anchor_for_event(event), metadata=metadata)
+            if not getattr(result, "success", False):
+                logger.error("[%s] could not send the reply-not-sent notice: %s", self.name, getattr(result, "error", ""))
+        except Exception:
+            logger.error("[%s] reply-not-sent notice failed", self.name, exc_info=True)
+
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
         a failing notice is logged, never raised). Returns the thread metadata used."""
@@ -4454,12 +4489,15 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        held_by_policy = False  # a final reply part refused locally by the outbound policy
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, held_by_policy
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                if not getattr(result, "success", False) and "outbound held" in str(getattr(result, "error", "") or ""):
+                    held_by_policy = True
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
@@ -4488,6 +4526,7 @@ class BasePlatformAdapter(ABC):
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
+                self._derive_reply_custody(event, response, extracted)
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
@@ -4527,6 +4566,8 @@ class BasePlatformAdapter(ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
+                if held_by_policy:
+                    await self._notify_reply_not_sent(event, response, _final_thread_metadata)
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.

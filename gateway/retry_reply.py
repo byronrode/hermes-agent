@@ -66,8 +66,8 @@ def _native_reply_scope(row, inbound):
     proof = {'kind':'authenticated_reply','home_scope':str(get_hermes_home()),
              'platform':row['platform'],'user_id':row['authenticated_actor'],'recipient':str(row['thread_id'] or row['chat_id']),
              'message_id':inbound['platform_message_id'],'source_text':inbound['content']}
-    digest = policy._text_digest(row['content'])
-    token = policy._provenance.set(lambda: dict(proof, _formatted_output_sha256s=(digest,)))
+    digests = (policy._text_digest(row['content']),) + ((policy._text_digest(''),) if row.get('media_file') else ())
+    token = policy._provenance.set(lambda: dict(proof, _formatted_output_sha256s=digests))
     try:
         yield
     finally:
@@ -124,12 +124,13 @@ class DiscordRecoveryAdapter:
                           error=result.get('error'))
 
 
-async def follow_up(adapter, content, *, source_row=None, discord_channel=None, reply_to=None, send=False):
+async def follow_up(adapter, content, *, source_row=None, discord_channel=None, reply_to=None, send=False, media_file=None):
     """Explicit operator follow-up, using the existing outbox and native sender.
 
     WhatsApp requires an actual persisted inbound; Discord's explicit operator
     mode retains ordinary outbound admission and binds an existing reply target.
     Neither mode fabricates an inbound event or changes a failed answer.
+    ``media_file`` sends one image after the text as the same authenticated reply.
     """
     from gateway.outbound_policy import evaluate
     if not content.strip():
@@ -154,12 +155,14 @@ async def follow_up(adapter, content, *, source_row=None, discord_channel=None, 
                 or not adapter._is_dm_allowed(actor)):
             raise ValueError('The native inbound does not authorize this WhatsApp conversation')
         row = dict(platform='whatsapp_cloud', chat_id=actor, thread_id=None, content=content,
-                   authenticated_actor=actor)
+                   authenticated_actor=actor, media_file=media_file)
         reference = inbound['platform_message_id']
         session_key = inbound['session_key']
     else:
         if not str(discord_channel or '').isdigit() or not str(reply_to or '').isdigit():
             raise ValueError('Exact Discord channel and original message are required')
+        if media_file:
+            raise ValueError('Image follow-ups are supported for the native WhatsApp reply only')
         row = dict(platform='discord', chat_id=str(discord_channel), thread_id=None, content=content)
         reference, session_key = str(reply_to), 'operator:discord:' + str(discord_channel)
     scope = lambda: _native_reply_scope(row, inbound) if inbound else nullcontext()
@@ -169,7 +172,9 @@ async def follow_up(adapter, content, *, source_row=None, discord_channel=None, 
         return admission
     source = dict(session_key=session_key, platform=row['platform'], channel_id=row['chat_id'], thread_id='',
                   run_id='operator-follow-up:' + reference, transport_profile='default')
-    identity = hashlib.sha256(content.encode()).hexdigest()
+    if media_file and not Path(media_file).is_file():
+        raise ValueError('The image to send does not exist')
+    identity = hashlib.sha256((content + '\0' + str(media_file or '')).encode()).hexdigest()
     previous = ledger.source_delivery_receipt(source, identity)
     if previous:
         return dict(success=True, delivered=True, state='already_delivered', message_id=previous['native_message_id'])
@@ -181,6 +186,11 @@ async def follow_up(adapter, content, *, source_row=None, discord_channel=None, 
         raise ValueError('This reply is already claimed; reconcile its existing receipt before retrying')
     with scope():
         result = await adapter.send(row['chat_id'], content, reply_to=reference)
+        if media_file and result.success and result.message_id:
+            media = await adapter.send_image_file(row['chat_id'], str(media_file))
+            if not media.success or not media.message_id:
+                return dict(success=False, delivered=True, state='unknown', obligation_id=oid,
+                            message_id=result.message_id, error='Text sent; image failed: ' + str(media.error))
     if not result.success or not result.message_id:
         return dict(success=False, delivered=False, state='unknown', obligation_id=oid, error=result.error)
     if not ledger.acknowledge_source_send(oid, result.message_id):
@@ -200,6 +210,7 @@ def main():
     modes.add_argument('--discord-channel')
     parser.add_argument('--reply-to')
     parser.add_argument('--reply-file', type=Path)
+    parser.add_argument('--media-file', type=Path, help='One image sent after the reply text (WhatsApp follow-up only)')
     parser.add_argument('--send',action='store_true',help='Reserve and deliver this verified exact reply once')
     args = parser.parse_args()
     async def run():
@@ -225,7 +236,8 @@ def main():
             if args.obligation:
                 return await retry_reply(args.obligation, adapter, send=args.send)
             return await follow_up(adapter, args.reply_file.read_text(), source_row=args.source_row,
-                                   discord_channel=args.discord_channel, reply_to=args.reply_to, send=args.send)
+                                   discord_channel=args.discord_channel, reply_to=args.reply_to, send=args.send,
+                                   media_file=args.media_file)
         config = load_gateway_config().platforms[platform]
         if platform==Platform.DISCORD:
             return await deliver(DiscordRecoveryAdapter(config))

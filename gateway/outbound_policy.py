@@ -50,8 +50,7 @@ def evaluate(platform: str, recipient: str, content: str, *, controls=None,
         if isinstance(receipt, dict) and receipt.get('allow') is True:
             if operation == 'emit':
                 if provenance and provenance.get('_handoff_key'):
-                    with _reply_grants_lock:
-                        _reply_grants.pop(provenance['_handoff_key'], None)
+                    _consume_grant(provenance['_handoff_key'])
                 else:
                     reply_handoff(platform, recipient, content, consume=True, profile_home=home)
             return receipt
@@ -248,6 +247,10 @@ _reply_grants = {}
 _reply_grants_lock = threading.Lock()
 
 
+_GRANT_SECONDS = 60
+_DERIVED_GRANT_SECONDS = 300  # media upload and chunked sends can outlast the text handoff
+
+
 def retain_final_reply(content):
     proof = current_provenance(content)
     if not proof or proof.get('kind') != 'authenticated_reply':
@@ -258,7 +261,52 @@ def retain_final_reply(content):
         for old, (_value, deadline) in list(_reply_grants.items()):
             if deadline < now:
                 _reply_grants.pop(old, None)
-        _reply_grants[key] = (proof, now + 60)
+        _reply_grants[key] = (proof, now + _GRANT_SECONDS)
+
+
+def derive_reply_grants(platform, recipient, original, texts, *, attachments=0, profile_home=None):
+    """Carry a retained final reply's custody to what the adapter actually sends.
+
+    The adapter splits a final reply into body text and attachments before
+    sending (a MEDIA: tag is stripped, the file goes as its own caption-less
+    message). Those outputs are not the exact string custody was retained for,
+    so without this the authenticated reply was held at its own provider send.
+    Only text and attachment count derived from the retained reply qualify; a
+    reply with no retained custody derives nothing.
+    """
+    from hermes_constants import get_hermes_home
+    home = str(profile_home or get_hermes_home())
+    recipient = str(recipient).lstrip('+')
+    with _reply_grants_lock:
+        now = time.monotonic()
+        value = _reply_grants.get((home, platform, recipient, _text_digest(original)))
+        if not value or value[1] < now:
+            return 0
+        proof = {key: item for key, item in value[0].items() if not key.startswith('_')}
+        granted = 0
+        for text in texts:
+            if text and text.strip():
+                _reply_grants[(home, platform, recipient, _text_digest(text))] = (
+                    dict(proof, _uses=1), now + _DERIVED_GRANT_SECONDS)
+                granted += 1
+        if attachments > 0:
+            # Each caption-less attachment is one provider emission with an empty body.
+            _reply_grants[(home, platform, recipient, _text_digest(''))] = (
+                dict(proof, _uses=int(attachments)), now + _DERIVED_GRANT_SECONDS)
+            granted += 1
+        return granted
+
+
+def _consume_grant(key):
+    with _reply_grants_lock:
+        value = _reply_grants.get(key)
+        if not value:
+            return
+        uses = int(value[0].get('_uses', 1)) - 1
+        if uses > 0:
+            value[0]['_uses'] = uses
+        else:
+            _reply_grants.pop(key, None)
 
 
 def reply_handoff(platform, recipient, content, *, consume=False, profile_home=None):
@@ -269,9 +317,10 @@ def reply_handoff(platform, recipient, content, *, consume=False, profile_home=N
         if not value or value[1] < time.monotonic():
             _reply_grants.pop(key, None)
             return None
-        if consume:
-            _reply_grants.pop(key, None)
-        return dict(value[0], _handoff_key=key)
+        grant = dict(value[0], _handoff_key=key)
+    if consume:
+        _consume_grant(key)
+    return grant
 
 
 @contextmanager

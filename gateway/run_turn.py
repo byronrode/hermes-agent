@@ -3812,11 +3812,89 @@ class GatewayTurnMixin:
                 if inspect.isawaitable(_bg_result):
                     await _bg_result
 
+    async def _run_agent_promise_guard(
+        self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
+    ) -> Optional[str]:
+        """Promise guard (gateway/promise_guard.py): after a final text reply from Byron's verified
+        identity, decide whether it promises work it did not deliver.
+
+        Returns the fixed continuation instruction when the turn must continue; otherwise ``None``.
+        At the cap it appends the fixed "Not done yet" line to the reply and records the open item.
+        Any failure here leaves the reply exactly as it was: the guard never blocks delivery."""
+        try:
+            from gateway import promise_guard as pg
+            if not pg.enabled() or turn_ctx.scheduled_heartbeat or turn_ctx.mute_notification_reply:
+                return None
+            if not isinstance(response, dict) or response.get("failed") or response.get("interrupted") \
+                    or (isinstance(result, dict) and result.get("interrupted")):
+                return None
+            text = response.get("final_response") or ""
+            if not isinstance(text, str) or not text.strip() or self._is_intentional_silence(response, text):
+                return None
+            state = turn_ctx.promise_guard
+            if state is None and is_machinery_display_kind(turn_ctx.persist_user_display_kind):
+                return None
+            from gateway.outbound_policy import current_provenance
+            proof = current_provenance(text)  # the live authenticated-reply proof, or None
+            if not pg.eligible_proof(proof):
+                return None
+            if state is None:
+                state = turn_ctx.promise_guard = pg.new_state(proof, proof.get("source_text") or "", turn_ctx.source)
+            verdict = await pg.classify_async(
+                text, state.get("request") or "", has_media=bool(response.get("media_files")),
+                run_in_executor=self._run_in_executor_with_context)
+            logger.info(
+                "promise_guard: session=%s continuation=%d promised=%s what=%r skipped=%s error=%s seconds=%s",
+                turn_ctx.session_key or "?", state["count"], verdict["promised_undelivered"], verdict.get("what"),
+                verdict.get("skipped"), verdict.get("error"), verdict.get("seconds"))
+            if not verdict["promised_undelivered"]:
+                return None
+            what = verdict["what"]
+            state["whats"].append(what)
+            if state["count"] < pg.max_continuations() \
+                    and turn_ctx._interrupt_depth + 1 < self._MAX_INTERRUPT_DEPTH:
+                state["count"] += 1
+                logger.info("promise_guard: continuing session=%s (%d/%d): %s", turn_ctx.session_key or "?",
+                            state["count"], pg.max_continuations(), what)
+                return pg.continuation_instruction(what)
+            await self._run_agent_promise_guard_stop(turn_ctx, adapter, response, result, stream_task, what)
+        except Exception:  # noqa: BLE001 - the guard must never take the reply down with it
+            logger.warning("promise_guard failed; reply left as is", exc_info=True)
+        return None
+
+    async def _run_agent_promise_guard_stop(
+        self, turn_ctx: TurnContext, adapter: Any, response: dict, result: Any, stream_task: Any, what: str,
+    ) -> None:
+        """The cap is reached and the reply is still a promise: say so plainly and file the open item."""
+        from gateway import promise_guard as pg
+        text = response.get("final_response") or ""
+        _sc = turn_ctx.stream_consumer_holder[0]
+        streamed = self._run_agent_stream_confirmed_final_delivery(
+            _sc, text, previewed=bool(response.get("response_previewed")))
+        if streamed:
+            # The reply already reached the chat as a stream; the stop line goes out as its own message.
+            await self._deliver_queued_first_response(
+                pg.stop_line(what), source=turn_ctx.source, adapter=adapter,
+                metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
+                text_already_delivered=False, deliver_media=False, stream_consumer=None,
+                session_key=turn_ctx.session_key, inbound_message_id=turn_ctx.inbound_message_id)
+        else:
+            response["final_response"] = pg.with_stop_line(text, what)
+            if isinstance(result, dict) and result is not response and "final_response" in result:
+                result["final_response"] = response["final_response"]
+        pg.record_open_item(turn_ctx.promise_guard, what, reply=text, session_key=turn_ctx.session_key,
+                            session_id=turn_ctx.session_id)
+        logger.warning("promise_guard: stopped session=%s after %d continuation(s): %s",
+                       turn_ctx.session_key or "?", turn_ctx.promise_guard["count"], what)
+
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
-        response: Any, result: Any, stream_task: Any,
+        response: Any, result: Any, stream_task: Any, promise_continuation: bool = False,
     ) -> Any:
-        """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
+        """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``).
+
+        ``promise_continuation`` marks the promise guard's own fixed instruction: it keeps the chain
+        state and the turn's channel prompt, and persists as an internal notice, not a user bubble."""
         from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
@@ -3861,6 +3939,12 @@ class GatewayTurnMixin:
         # Queued Discord turns carry the same routing note as first turns; persist the authored text.
         next_persist_message = None
         next_display_kind = display_kind_for_event(pending_event)
+        next_promise_guard = None
+        if promise_continuation:
+            from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
+            next_display_kind = INTERNAL_NOTIFICATION_DISPLAY_KIND
+            next_channel_prompt = turn_ctx.channel_prompt
+            next_promise_guard = turn_ctx.promise_guard
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
@@ -3939,6 +4023,7 @@ class GatewayTurnMixin:
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
                 persist_user_display_metadata=diagnostic_metadata(pending_event) or None,
+                promise_guard=next_promise_guard,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -4270,6 +4355,7 @@ class GatewayTurnMixin:
         persist_user_display_metadata: Optional[dict] = None,
         scheduled_heartbeat: bool = False,
         publication_allowed=None,
+        promise_guard: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4306,7 +4392,7 @@ class GatewayTurnMixin:
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
-            scheduled_heartbeat=scheduled_heartbeat,
+            scheduled_heartbeat=scheduled_heartbeat, promise_guard=promise_guard,
         )
         if publication_allowed is not None:
             turn_ctx.publication_allowed = publication_allowed
@@ -4352,6 +4438,15 @@ class GatewayTurnMixin:
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
+                )
+            # Promise guard: a final reply that promises work it did not deliver is not the end of the
+            # turn. Continue inside this same authenticated turn (the queued-follow-up lane), so the
+            # outbound gate still sees a reply to Byron's message.
+            promise_instruction = await self._run_agent_promise_guard(turn_ctx, adapter, response, result, stream_task)
+            if promise_instruction:
+                return await self._run_agent_queued_followup(
+                    turn_ctx, adapter, promise_instruction, None, response, result, stream_task,
+                    promise_continuation=True,
                 )
         finally:
             await self._run_agent_cleanup_turn_tasks(

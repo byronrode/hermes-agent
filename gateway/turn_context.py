@@ -60,6 +60,9 @@ class TurnContext:
     # "internal_notification" for async-delegation/background notifications (#82888).
     persist_user_display_kind: Optional[str] = None
     persist_user_display_metadata: Optional[dict] = None
+    # Promise guard chain state for this original user message (gateway/promise_guard.py); None until
+    # the first authenticated owner turn is checked. Carried through continuation turns.
+    promise_guard: Optional[dict] = None
     user_config: Any = None
     mute_notification_reply: bool = False
     publication_allowed: Callable[..., bool] = field(default=lambda **_kwargs: True)

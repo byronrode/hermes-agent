@@ -76,7 +76,7 @@ async def run_turn(monkeypatch, tmp_path, replies, seen):
 
 def spooled(home):
     records = []
-    for path in sorted((home / "state" / "feedback" / "spool").glob("*.jsonl")) if (home / "state" / "feedback" / "spool").exists() else []:
+    for path in sorted((home / "state" / "feedback" / "spool").glob("promise-*.jsonl")) if (home / "state" / "feedback" / "spool").exists() else []:
         records += [json.loads(line) for line in path.read_text().splitlines()]
     return records
 

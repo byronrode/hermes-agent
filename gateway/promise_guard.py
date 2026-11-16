@@ -260,7 +260,7 @@ def record_open_item(state: Dict[str, Any], what: str, *, reply: str = "", sessi
             "request_text": feedback._trim(state.get("request"), 1000),
             "reply_text": feedback._trim(reply, 1000),
             "session_key": session_key or "", "session_id": session_id or ""}
-        feedback._spool(record)
+        feedback._spool(record, prefix="promise")
         with feedback._LOCK, feedback._connect() as db:
             db.execute(_OPEN_SCHEMA)
             db.execute("INSERT INTO promise_open(chat_key,platform,chat_id,item_key,opened_at) VALUES(?,?,?,?,?) "
@@ -288,7 +288,7 @@ def note_owner_message(platform: str, chat_id: Any, user_id: Optional[str]) -> b
             db.execute("DELETE FROM promise_open WHERE chat_key=?", (chat_key,))
         feedback._spool({"type": "open_item_clear", "channel": platform, "chat_id": str(chat_id),
                          "key": row["item_key"],
-                         "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+                         "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}, prefix="promise")
         return True
     except Exception:  # noqa: BLE001
         logger.warning("[promise_guard] could not clear the open item", exc_info=True)

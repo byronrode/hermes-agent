@@ -158,15 +158,17 @@ def _trim(text: Optional[str], cap: int) -> str:
     return text if len(text) <= cap else text[: cap - 1] + "…"
 
 
-def _spool(record: Dict[str, Any]) -> None:
-    """Append one record for Trail to ingest. Never raises into the caller."""
+def _spool(record: Dict[str, Any], *, prefix: str = "feedback") -> None:
+    """Append one record for Trail to ingest. Never raises into the caller. ``prefix`` names the
+    file family (``feedback-DATE.jsonl``; the promise guard writes ``promise-DATE.jsonl`` so a Trail
+    that predates it never consumes and drops those lines)."""
     record = {"id": uuid.uuid4().hex, **record}
     try:
         directory = _state_dir() / "spool"
         directory.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         stamp = datetime.fromtimestamp(time.time(), timezone.utc).strftime("%Y%m%d")
-        with _LOCK, open(directory / f"feedback-{stamp}.jsonl", "a", encoding="utf-8") as fh:
+        with _LOCK, open(directory / f"{prefix}-{stamp}.jsonl", "a", encoding="utf-8") as fh:
             fh.write(line)
     except OSError:
         logger.warning("[feedback] could not write spool record", exc_info=True)

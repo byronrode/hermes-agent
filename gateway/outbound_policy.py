@@ -20,6 +20,15 @@ class OutboundHeld(RuntimeError):
 
 def evaluate(platform: str, recipient: str, content: str, *, controls=None,
              profile_home=None, dry_run=False, operation='send', test=False, probe=False) -> dict[str, Any]:
+    receipt = _evaluate(platform, recipient, content, controls=controls, profile_home=profile_home,
+                        dry_run=dry_run, operation=operation, test=test, probe=probe)
+    if receipt.get('allow') is not True:
+        note_held_reply(platform, recipient, content, receipt.get('reason', ''))
+    return receipt
+
+
+def _evaluate(platform: str, recipient: str, content: str, *, controls=None,
+              profile_home=None, dry_run=False, operation='send', test=False, probe=False) -> dict[str, Any]:
     from hermes_constants import get_hermes_home
     from hermes_yaml import safe_load
     home = Path(profile_home or get_hermes_home())
@@ -184,15 +193,19 @@ def authorized_cron_scope(job, content, *, for_failure=False):
         _provenance.reset(token)
 
 
-@contextmanager
-def authorized_reply_scope(runner, event, source, session_key, generation):
-    active = True
+def _reply_proof_resolver(runner, event, source, session_key, generation, is_active):
+    """Build the live resolver for one accepted inbound message's reply custody.
+
+    The identity is captured here, before trusted skill/context rendering rewrites ``event.text``;
+    presentation text is not the authenticated envelope identity. Every send re-validates it.
+    ``generation`` is None for custody that spans the whole handling of the message (commands,
+    acknowledgements, errors): those outlive, and may themselves end, the agent run generation.
+    """
     platform = getattr(getattr(source, 'platform', None), 'value', str(getattr(source, 'platform', '')))
     actor, recipient = str(source.user_id or ''), str(source.chat_id or '')
     message_id = str(getattr(event, 'message_id', '') or '')
     original = str(getattr(event, 'text', '') or '')
     raw = getattr(event, 'raw_message', None)
-    home = None
     from hermes_constants import get_hermes_home
     home = str(get_hermes_home())
     native_valid = False
@@ -205,12 +218,10 @@ def authorized_reply_scope(runner, event, source, session_key, generation):
         reader = getattr(intake, 'source_event_identity', None)
         native_valid = bool(callable(reader) and reader(event))
     def resolve():
-        # Native identity is captured before trusted skill/context rendering rewrites
-        # event.text. Presentation text is not the authenticated envelope identity.
-        if (not active or not native_valid or event is None or getattr(event, 'internal', False)
+        if (not is_active() or not native_valid or event is None or getattr(event, 'internal', False)
                 or getattr(source, 'is_bot', False) or not message_id
                 or str(get_hermes_home()) != home
-                or not runner._is_session_run_current(session_key, generation)
+                or (generation is not None and not runner._is_session_run_current(session_key, generation))
                 or not runner._is_user_authorized_for_source(source, allow_adapter_delegation=False)
                 or str(source.user_id or '') != actor or str(source.chat_id or '') != recipient
                 or str(getattr(event, 'message_id', '') or '') != message_id):
@@ -221,12 +232,139 @@ def authorized_reply_scope(runner, event, source, session_key, generation):
             return None
         return {'kind': 'authenticated_reply', 'home_scope': home, 'platform': platform, 'user_id': actor,
                 'recipient': recipient, 'message_id': message_id, 'source_text': original}
+    return resolve
+
+
+@contextmanager
+def authorized_reply_scope(runner, event, source, session_key, generation):
+    active = True
+    resolve = _reply_proof_resolver(runner, event, source, session_key, generation, lambda: active)
     token = _provenance.set(resolve)
     try:
         yield
     finally:
         active = False
         _provenance.reset(token)
+
+
+# What the gateway is answering right now, whether or not custody could be proved for it. A send that
+# the gate holds while this is set is a held REPLY to Byron, which must reach his waiting list.
+_inbound_context = ContextVar('outbound_inbound_context', default=None)
+
+
+@contextmanager
+def authorized_inbound_scope(runner, event, source=None):
+    """Reply custody for the WHOLE handling of one accepted inbound message.
+
+    Entered by the adapter when it accepts a message (idle turn or message that arrives while the
+    session is busy) and left when its handling ends: slash-command answers, busy/queued/interrupt
+    acknowledgements, error notices, interim messages and the final reply all happen inside it.
+    Internal events, bots, unauthorized senders and unverified native envelopes get no custody. The
+    agent-turn scope nested inside it is stricter (it also pins the run generation).
+    """
+    source = source or getattr(event, 'source', None)
+    active = True
+    try:
+        resolve = _reply_proof_resolver(runner, event, source, None, None, lambda: active)
+        context = {'platform': getattr(getattr(source, 'platform', None), 'value', str(getattr(source, 'platform', ''))),
+                   'chat_id': str(source.chat_id or ''), 'user_id': str(source.user_id or ''),
+                   'message_id': str(getattr(event, 'message_id', '') or ''), 'text': str(getattr(event, 'text', '') or ''),
+                   'source': source, 'internal': bool(getattr(event, 'internal', False)),
+                   'bot': bool(getattr(source, 'is_bot', False))}
+    except Exception:
+        resolve, context = (lambda: None), None
+    token = _provenance.set(resolve)
+    ctx_token = _inbound_context.set(context)
+    try:
+        yield
+    finally:
+        active = False
+        _inbound_context.reset(ctx_token)
+        _provenance.reset(token)
+
+
+_HELD_REPLY_SEEN = {}
+
+
+def note_held_reply(platform, recipient, content, reason):
+    """The gate held a message while the gateway was answering Byron's own message: tell Trail, so it
+    shows in his waiting list instead of vanishing. Never raises, never blocks the send path."""
+    try:
+        ctx = _inbound_context.get()
+        if (not ctx or ctx['internal'] or ctx['bot'] or ctx['platform'] != platform
+                or str(recipient).lstrip('+') != ctx['chat_id'].lstrip('+') or not ctx['message_id']):
+            return
+        from gateway import feedback, promise_guard
+        if not feedback.is_owner(ctx['platform'], ctx['user_id']):
+            return
+        key = f"replyheld:{ctx['platform']}:{ctx['chat_id']}:{ctx['message_id']}"
+        now = time.monotonic()
+        if _HELD_REPLY_SEEN.get(key, 0) > now - 600:
+            return
+        _HELD_REPLY_SEEN[key] = now
+        for old, seen in list(_HELD_REPLY_SEEN.items()):
+            if seen < now - 3600:
+                _HELD_REPLY_SEEN.pop(old, None)
+        source = ctx['source']
+        state = {'platform': ctx['platform'], 'chat_id': ctx['chat_id'], 'message_id': ctx['message_id'],
+                 'request': ctx['text'], 'count': 0,
+                 'realm': feedback.resolve_realm(ctx['platform'], getattr(source, 'chat_type', None),
+                                                 getattr(source, 'scope_id', None), ctx['chat_id'],
+                                                 getattr(source, 'profile', None))}
+        what = ('a reply to your ' + ('/' + ctx['text'].lstrip('/').split()[0] + ' command' if ctx['text'].startswith('/')
+                else 'message') + ' was held and not delivered')
+        promise_guard.record_open_item(state, what, reply=str(content or ''), kind='reply_held', key=key)
+    except Exception:
+        pass
+
+
+@contextmanager
+def restart_reply_scope(record, notice, *, still_authorized=None):
+    """Custody for the one message that tells Byron his own /restart is done.
+
+    The /restart handler writes ``reply_custody`` into ``.restart_notify.json`` while it holds a
+    proven inbound scope. After the restart the new process has no inbound message, so this rebuilds
+    the authenticated reply from that small record. It is single use (the caller unlinks the record
+    in a finally), expires, belongs to this profile home, and only covers the notice text given.
+    """
+    from hermes_constants import get_hermes_home
+    custody = (record or {}).get('reply_custody') if isinstance(record, dict) else None
+    active = True
+    def resolve():
+        try:
+            if (not active or not isinstance(custody, dict) or custody.get('platform') != record.get('platform')
+                    or str(custody.get('home_scope')) != str(get_hermes_home())
+                    or str(custody.get('recipient') or '') != str(record.get('chat_id') or '')
+                    or not custody.get('message_id') or not custody.get('user_id')
+                    or float(custody.get('expires_at') or 0) < time.time()
+                    or (callable(still_authorized) and not still_authorized())):
+                return None
+            return {'kind': 'authenticated_reply', 'home_scope': custody['home_scope'], 'platform': custody['platform'],
+                    'user_id': str(custody['user_id']), 'recipient': str(custody['recipient']),
+                    'message_id': str(custody['message_id']), 'source_text': '/restart',
+                    '_formatted_output_sha256s': (_text_digest(notice),)}
+        except Exception:
+            return None
+    token = _provenance.set(resolve)
+    try:
+        yield
+    finally:
+        active = False
+        _provenance.reset(token)
+
+
+RESTART_CUSTODY_SECONDS = 900
+
+
+def restart_reply_custody():
+    """The expiring record for ``.restart_notify.json``, or None without a proven inbound scope."""
+    reader = _provenance.get()
+    proof = reader() if callable(reader) else None
+    if not proof or proof.get('kind') != 'authenticated_reply':
+        return None
+    return {'platform': proof['platform'], 'recipient': proof['recipient'], 'user_id': proof['user_id'],
+            'message_id': proof['message_id'], 'home_scope': proof['home_scope'],
+            'issued_at': time.time(), 'expires_at': time.time() + RESTART_CUSTODY_SECONDS}
 
 
 def current_provenance(content):

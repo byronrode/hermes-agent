@@ -242,7 +242,8 @@ _OPEN_SCHEMA = ("CREATE TABLE IF NOT EXISTS promise_open("
 
 
 def record_open_item(state: Dict[str, Any], what: str, *, reply: str = "", session_key: Optional[str] = None,
-                     session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                     session_id: Optional[str] = None, kind: str = "promise_not_delivered",
+                     key: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Spool one ``open_item`` record for Trail's attention list (the same append-only spool the
     votes use; the gateway never writes the Trail database) and remember it locally so Byron's next
     message in that chat can clear it. Never raises."""
@@ -251,8 +252,8 @@ def record_open_item(state: Dict[str, Any], what: str, *, reply: str = "", sessi
         platform = str(state.get("platform") or "")
         chat_id = str(state.get("chat_id") or "")
         record = {
-            "type": "open_item", "kind": "promise_not_delivered",
-            "key": f"promise:{platform}:{chat_id}:{state.get('message_id') or ''}",
+            "type": "open_item", "kind": kind,
+            "key": key or f"promise:{platform}:{chat_id}:{state.get('message_id') or ''}",
             "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "channel": platform, "chat_id": chat_id, "message_id": str(state.get("message_id") or ""),
             "realm": state.get("realm") or "unknown",

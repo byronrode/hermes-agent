@@ -125,6 +125,13 @@ def _restart_notify_payload(event: MessageEvent) -> dict:
     optional = (("thread_id", source.thread_id), ("message_id", event.message_id),
                 ("profile", getattr(source, "profile", None)))
     data.update({k: v for k, v in optional if v})
+    # The answer to this /restart is sent by the NEW process, which has no inbound message. Keep the
+    # proof that this command came from the authenticated sender: small, expiring, consumed with the
+    # marker (the notifier unlinks it after one send).
+    from gateway.outbound_policy import restart_reply_custody
+    custody = restart_reply_custody()
+    if custody:
+        data["reply_custody"] = custody
     return data
 
 

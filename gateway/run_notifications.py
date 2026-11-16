@@ -827,10 +827,17 @@ class GatewayNotificationsMixin:
                 for field in ("user_id", "scope_id"):
                     if data.get(field):
                         metadata[field] = str(data[field])
-            result = await transport.send(
-                platform, str(chat_id), "♻ Gateway restarted successfully. Your session continues.",
-                metadata=_non_conversational_metadata(metadata, platform=platform),
-            )
+            from gateway.outbound_policy import restart_reply_scope
+            notice = "♻ Gateway restarted successfully. Your session continues."
+            adapter_dm_allowed = getattr(transport.adapter, "_is_dm_allowed", None)
+            with restart_reply_scope(
+                data, notice,
+                still_authorized=(lambda: bool(adapter_dm_allowed(str(chat_id)))) if callable(adapter_dm_allowed) else None,
+            ):
+                result = await transport.send(
+                    platform, str(chat_id), notice,
+                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                )
             # adapter.send() catches provider errors (e.g. "Chat not found") and returns
             # SendResult(success=False) rather than raising, so inspect the result before claiming success.
             if _send_failed(result):

@@ -3530,6 +3530,20 @@ class BasePlatformAdapter(ABC):
         if eph_ttl > 0 and result.success and result.message_id:
             self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
 
+    def _inbound_reply_scope(self, event: MessageEvent):
+        """Reply custody for the whole handling of one accepted inbound message (slash command,
+        acknowledgement, error notice, interim message, final reply). A no-op without a runner; the
+        outbound policy still decides, and only an authenticated sender's own message earns custody."""
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None or event is None:
+            return contextlib.nullcontext()
+        try:
+            from gateway.outbound_policy import authorized_inbound_scope
+            return authorized_inbound_scope(runner, event)
+        except Exception:
+            logger.debug("[%s] inbound reply scope unavailable", self.name, exc_info=True)
+            return contextlib.nullcontext()
+
     def _media_delivery_scope(self, source: Optional[SessionSource]):
         """Routed home + terminal policy for post-handler text, media and error delivery;
         a no-op without a runner or outside multiplexing."""
@@ -3990,6 +4004,12 @@ class BasePlatformAdapter(ABC):
         event._gateway_accepted = self._start_session_processing(event, session_key)
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
+        """Route a message that arrived while the session is busy, under the message's reply custody
+        so its acknowledgement and any command answer are replies, not stray outbound messages."""
+        with self._inbound_reply_scope(event):
+            await self._handle_message_while_active_scoped(event, session_key)
+
+    async def _handle_message_while_active_scoped(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
         commands / clarify replies dispatch inline, everything else is queued."""
         # Bypass commands run inline: queued they'd leak as user text (/new) or deadlock
@@ -4360,9 +4380,10 @@ class BasePlatformAdapter(ABC):
         """A reply part that was definitively refused (policy hold, provider rejection) must not end
         in silence: say so in the same chat."""
         try:
-            from gateway.outbound_policy import derive_reply_grants
-            if not derive_reply_grants(self._reply_platform(event), event.source.chat_id, response,
-                                       [self._REPLY_NOT_SENT_NOTICE]):
+            from gateway.outbound_policy import current_provenance, derive_reply_grants
+            if not (current_provenance(self._REPLY_NOT_SENT_NOTICE)
+                    or derive_reply_grants(self._reply_platform(event), event.source.chat_id, response,
+                                           [self._REPLY_NOT_SENT_NOTICE])):
                 logger.error("[%s] reply held by outbound policy and no authenticated custody to say so in %s",
                              self.name, event.source.chat_id)
                 return
@@ -4516,6 +4537,11 @@ class BasePlatformAdapter(ABC):
             self._cleanup_finished_session_task(session_key, interrupt_event)
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+        """Process one accepted message under its reply custody for the whole handling."""
+        with self._inbound_reply_scope(event):
+            await self._process_message_background_scoped(event, session_key)
+
+    async def _process_message_background_scoped(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
         reply_part_failed = False  # a final reply part (text or attachment) was definitively refused

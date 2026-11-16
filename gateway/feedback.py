@@ -508,6 +508,9 @@ def begin_turn(event: Any, source: Any, session_id: Optional[str], turn_id: Opti
         skill = getattr(event, "auto_skill", None)
         event._feedback_turn = {"session_id": session_id, "turn_id": turn_id,
                                 "skill": ",".join(skill) if isinstance(skill, (list, tuple)) else skill}
+        # Byron writing again answers a "Not done yet" stop (gateway/promise_guard.py).
+        from gateway import promise_guard
+        promise_guard.note_owner_message(platform, source.chat_id, getattr(source, "user_id", None))
         reply_to = getattr(event, "reply_to_message_id", None)
         if reply_to:
             lesson_id = note_reply(

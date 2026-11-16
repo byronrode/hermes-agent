@@ -211,3 +211,40 @@ async def test_the_continuation_keeps_the_authenticated_reply_custody(monkeypatc
     assert seen == ["hello", INSTRUCTION] and result["final_response"] == RESULT
     assert seen_proofs == [(PROMISE, "authenticated_reply")]            # the pre-continuation send is custodial
     assert outbound_policy.current_provenance("x") is None              # scope closed afterwards
+
+
+# ── the open item leaves the list when Byron writes again ───────────────────
+
+def _state(chat="27800000000"):
+    return pg.new_state({"platform": "whatsapp_cloud", "recipient": chat, "user_id": OWNER, "message_id": "wamid.TEST"},
+                        "ask", SimpleNamespace(chat_type="dm", scope_id=None, profile=None))
+
+
+def test_byrons_next_message_in_that_chat_clears_the_open_item(guard_home):
+    pg.record_open_item(_state(), "send the images", reply="I'm checking.")
+    assert [r["type"] for r in spooled(guard_home)] == ["open_item"]
+    assert pg.note_owner_message("whatsapp_cloud", "27899999999", OWNER) is False       # another chat
+    assert pg.note_owner_message("whatsapp_cloud", "27800000000", "someone-else") is False  # not him
+    assert pg.note_owner_message("whatsapp_cloud", "27800000000", OWNER) is True
+    cleared = spooled(guard_home)[-1]
+    assert cleared["type"] == "open_item_clear" and cleared["chat_id"] == "27800000000"
+    assert cleared["key"] == "promise:whatsapp_cloud:27800000000:wamid.TEST"
+    assert pg.note_owner_message("whatsapp_cloud", "27800000000", OWNER) is False          # once only
+    assert [r["type"] for r in spooled(guard_home)] == ["open_item", "open_item_clear"]
+
+
+def test_begin_turn_clears_the_open_item_for_his_real_message(guard_home):
+    pg.record_open_item(_state(), "send the images")
+    source = SimpleNamespace(platform=Platform.WHATSAPP_CLOUD, chat_id="27800000000", user_id=OWNER, chat_type="dm",
+                             thread_id=None, scope_id=None, profile=None)
+    event = SimpleNamespace(channel_prompt=None, auto_skill=None, reply_to_message_id=None, message_id="m2", text="continue")
+    feedback.begin_turn(event, source, "sess", "turn")
+    assert spooled(guard_home)[-1]["type"] == "open_item_clear"
+
+
+def test_nothing_is_spooled_for_an_ordinary_message(guard_home):
+    source = SimpleNamespace(platform=Platform.WHATSAPP_CLOUD, chat_id="27800000000", user_id=OWNER, chat_type="dm",
+                             thread_id=None, scope_id=None, profile=None)
+    event = SimpleNamespace(channel_prompt=None, auto_skill=None, reply_to_message_id=None, message_id="m2", text="hi")
+    feedback.begin_turn(event, source, "sess", "turn")
+    assert spooled(guard_home) == []

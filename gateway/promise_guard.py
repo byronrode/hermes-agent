@@ -61,7 +61,7 @@ promised_undelivered is true only when ALL of these hold:
 promised_undelivered is false for: a direct answer or result; a reply that contains the finished output or an attachment; a question or an offer phrased as a question ("Want me to ...?"); an admission that it cannot do something and why; a report of work already finished (past tense); a confirmation that a reminder or task was already created; a short acknowledgement of thanks or a greeting; an explanation of how something works.
 
 Answer with ONE line of strict JSON and nothing else:
-{"promised_undelivered": true|false, "what": "<short phrase naming the undelivered work, in the first person, empty if false>"}"""
+{"promised_undelivered": true|false, "what": "<the undelivered work as a short verb phrase with no subject, such as: send the 20 spine images; empty if false>"}"""
 
 
 # ── configuration (kill switch) ─────────────────────────────────────────────
@@ -236,10 +236,16 @@ def new_state(proof: Dict[str, Any], request: str, source: Any = None) -> Dict[s
 
 # ── the open item in Trail ──────────────────────────────────────────────────
 
+_OPEN_SCHEMA = ("CREATE TABLE IF NOT EXISTS promise_open("
+                "chat_key TEXT PRIMARY KEY, platform TEXT NOT NULL, chat_id TEXT NOT NULL, item_key TEXT NOT NULL, "
+                "opened_at REAL NOT NULL)")
+
+
 def record_open_item(state: Dict[str, Any], what: str, *, reply: str = "", session_key: Optional[str] = None,
                      session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Spool one ``open_item`` record for Trail's attention list (the same append-only spool the
-    votes use; the gateway never writes the Trail database). Never raises."""
+    votes use; the gateway never writes the Trail database) and remember it locally so Byron's next
+    message in that chat can clear it. Never raises."""
     try:
         from gateway import feedback
         platform = str(state.get("platform") or "")
@@ -255,10 +261,38 @@ def record_open_item(state: Dict[str, Any], what: str, *, reply: str = "", sessi
             "reply_text": feedback._trim(reply, 1000),
             "session_key": session_key or "", "session_id": session_id or ""}
         feedback._spool(record)
+        with feedback._LOCK, feedback._connect() as db:
+            db.execute(_OPEN_SCHEMA)
+            db.execute("INSERT INTO promise_open(chat_key,platform,chat_id,item_key,opened_at) VALUES(?,?,?,?,?) "
+                       "ON CONFLICT(chat_key) DO UPDATE SET item_key=excluded.item_key, opened_at=excluded.opened_at",
+                       (f"{platform}:{chat_id}", platform, chat_id, record["key"], time.time()))
         return record
     except Exception:  # noqa: BLE001
         logger.warning("[promise_guard] could not record the open item", exc_info=True)
         return None
+
+
+def note_owner_message(platform: str, chat_id: Any, user_id: Optional[str]) -> bool:
+    """Byron wrote in a chat where a stopped promise is waiting: that is the answer the stop line asked
+    for. Spools ``open_item_clear`` (Trail drops the item from the attention list). Never raises."""
+    try:
+        from gateway import feedback
+        if not (chat_id and feedback.is_owner(platform, user_id)):
+            return False
+        chat_key = f"{platform}:{chat_id}"
+        with feedback._LOCK, feedback._connect() as db:
+            db.execute(_OPEN_SCHEMA)
+            row = db.execute("SELECT item_key FROM promise_open WHERE chat_key=?", (chat_key,)).fetchone()
+            if row is None:
+                return False
+            db.execute("DELETE FROM promise_open WHERE chat_key=?", (chat_key,))
+        feedback._spool({"type": "open_item_clear", "channel": platform, "chat_id": str(chat_id),
+                         "key": row["item_key"],
+                         "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("[promise_guard] could not clear the open item", exc_info=True)
+        return False
 
 
 # ── command line: show the switch, try the classifier on a text ─────────────
